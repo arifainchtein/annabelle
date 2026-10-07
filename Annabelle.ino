@@ -24,6 +24,11 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <WeatherForecastManager.h>
+#include <VitalSignsRecord.h>
+#include <VitalSignsStore.h>
+#include <DeviceIdentityStore.h>
+#include <esp_system.h>
+#include <esp_core_dump.h>
 
 SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 
@@ -120,6 +125,32 @@ DigitalStablesDataSerializer digitalStablesDataSerializer;
 PanchoConfigData panchoConfigData;
 AnnabelleData annabelleData;
 
+//
+// Every LoRa struct is identified by its size alone, so all of them must differ - checked at
+// compile time instead of discovered in the field. Covers what Annabelle receives plus what it
+// sends (devices dispatch on size too). Member function, not a free one, so the Arduino
+// prototype generator leaves it alone.
+//
+struct LoRaPacketSizeCheck {
+  static constexpr bool allDistinct(const size_t* sizes, size_t n, size_t i, size_t j) {
+    return i >= n ? true
+         : j >= n ? allDistinct(sizes, n, i + 1, i + 2)
+         : (sizes[i] != sizes[j] && allDistinct(sizes, n, i, j + 1));
+  }
+};
+constexpr size_t loraPacketSizes[] = {
+  sizeof(LangleyData), sizeof(GloriaTankFlowPumpData), sizeof(DigitalStablesData), sizeof(ChinampaData),
+  sizeof(SeedlingMonitorData), sizeof(CommaRecord), sizeof(VitalSignsRecord), sizeof(WeatherForecastUpdate),
+  sizeof(GraveyardShiftUpdate), sizeof(RequestCommand), sizeof(DeviceIdentityRecord)
+};
+static_assert(LoRaPacketSizeCheck::allDistinct(loraPacketSizes, sizeof(loraPacketSizes) / sizeof(loraPacketSizes[0]), 0, 1),
+              "two LoRa packet structs have the same size - receivers dispatch on size, so they would be confused");
+
+// Latest VitalSignsRecord per device, relayed to the Pi with AsyncData - see VitalSignsStore.h
+VitalSignsStore vitalSignsStore;
+// Latest DeviceIdentityRecord per device (product definition + running build), relayed the same way
+DeviceIdentityStore deviceIdentityStore;
+
 String serialNumber;
 uint8_t delayTime = 10;
 
@@ -149,6 +180,12 @@ RTCInfoRecord currentTimerRecord;
 volatile bool clockTicked = false;
 volatile bool loraReceived = false;
 volatile int loraPacketSize = 0;
+// Set by onLoraDio0() (DIO0 rose: RX done, or TX done during a send). loop() then reads the radio
+// with LoRa.parsePacket(). The radio is NOT touched from the interrupt: arduino-LoRa's own
+// LoRa.onReceive() handler does SPI transactions inside the ISR, which take the SPI bus mutex -
+// when that collided with SPI use in loop() the board panicked with
+// "assert failed: xQueueSemaphoreTake queue.c:1718" (core dump 2026-10-05, every few minutes).
+volatile bool loraDio0Fired = false;
 int lastReceivedPacketSize = 0;
 
 RTCInfoRecord lastReceptionRTCInfoRecord;
@@ -161,6 +198,15 @@ SeedlingMonitorData seedlingMonitorData;
 CommaRecord commaRecord;
 String timezone;
 
+// RTC <- internet time. The PCF8563 has no daylight-saving logic and the only code that set it
+// from the internet (SetTimeFromInternet) ran on a manual serial command, so on 2026-10-04 (DST
+// start) Annabelle stayed on standard time. configTzTime() in setup() starts SNTP, which keeps
+// syncing in the background; syncRtcFromNtp() copies the local time (TZ rule in `timezone`, DST
+// included) into the RTC whenever they differ by more than RTC_SYNC_TOLERANCE_SEC. Tried every
+// minute until the first successful check after boot, then hourly at minute 7.
+#define RTC_SYNC_TOLERANCE_SEC 5
+bool rtcCheckedSinceBoot = false;
+
 CRGBPalette16 currentPalette;
 TBlendType currentBlending;
 
@@ -169,6 +215,39 @@ CRGBPalette16 loraReceivePalette(CRGB::Red, CRGB::HotPink, CRGB::LightPink, CRGB
 CRGBPalette16 asyncDataPalette(CRGB::Yellow, CRGB::Orange, CRGB::Yellow, CRGB::Orange);
 
 bool switchPositionLeft = true;  // left position = show received data, right position = show weather forecast
+bool weatherScreenShown = false;  // the weather page is on the OLED, so loop() may refresh its clock line (cleared by centerText())
+
+//
+// Reset diagnostics - the PCB has no external watchdog, so record why the ESP32
+// last reset (esp_reset_reason) plus how long it had been up, to tell apart
+// power-loss/EN-pin resets (both POWERON), brownouts and firmware crashes.
+//
+#define RESET_LOG_FILE "/resetlog.txt"
+#define RESET_LOG_MAX_LINES 20
+#define RESET_DIAG_MAGIC 0xA5B3C7D1
+// RTC_NOINIT survives software resets, panics, watchdog resets and usually brownouts,
+// but not a power-on or an EN-pin reset - the magic tells us whether it's valid.
+RTC_NOINIT_ATTR uint32_t resetDiagMagic;
+RTC_NOINIT_ATTR uint32_t resetDiagBootCount;
+RTC_NOINIT_ATTR uint32_t resetDiagUptimeSeconds;
+RTC_NOINIT_ATTR uint32_t resetDiagMinFreeHeap;  // ESP.getMinFreeHeap() as of the last second before the reset
+String resetReason = "";
+uint32_t previousUptimeSeconds = 0;
+uint32_t previousMinFreeHeap = 0;  // lowest free heap reached before the reset (0 = unknown) - a falling value points to a leak
+bool previousUptimeKnown = false;
+//
+// Crash capture - the ESP32 core writes a core dump to the "coredump" flash partition on every
+// panic. At boot recordCoreDump() turns it into one line, keeps it in LAST_CRASH_FILE (newest
+// crash only, survives power loss) and appends it to RESET_LOG_FILE; the dump stays in flash for
+// esp-coredump and a fingerprint stops it being reported twice. The line rides on every AsyncData terminator as "|Crash=..." until the next crash:
+//   <rtc date time>;<panic reason>;<task>;<pc>;<backtrace pcs, space separated>;<elf sha256 prefix>;
+//   cause=<exccause> vaddr=<excvaddr> a0=<return address> epc1=... (EPC registers present in the dump)
+// Decode the addresses with xtensa-esp32-elf-addr2line -pfiaC -e Annabelle.ino.elf <pc> <bt...>
+// against the .elf of the build that crashed (the sha prefix identifies it) - keep a copy of the
+// .elf of every build that gets flashed (Projects/Annabelle/claude/builds/).
+//
+#define LAST_CRASH_FILE "/lastcrash.txt"
+String lastCrash = "";
 
 //
 // Lora Functions
@@ -230,6 +309,12 @@ uint8_t calculateChecksum(const T& data) {
     checksumOffset = offsetof(DigitalStablesData, checksum);
   } else if constexpr (std::is_same<T, CommaRecord>::value) {
     checksumOffset = offsetof(CommaRecord, checksum);
+  } else if constexpr (std::is_same<T, LangleyData>::value) {
+    checksumOffset = offsetof(LangleyData, checksum);
+  } else if constexpr (std::is_same<T, VitalSignsRecord>::value) {
+    checksumOffset = offsetof(VitalSignsRecord, checksum);
+  } else if constexpr (std::is_same<T, DeviceIdentityRecord>::value) {
+    checksumOffset = offsetof(DeviceIdentityRecord, checksum);
   }
 
   for (size_t i = 0; i < checksumOffset; i++) {
@@ -252,10 +337,33 @@ bool validateChecksum(const T& receivedData) {
   } else if constexpr (std::is_same<T, CommaRecord>::value) {
     receivedChecksum = tempData.checksum;
     tempData.checksum = 0;
+  } else if constexpr (std::is_same<T, LangleyData>::value) {
+    receivedChecksum = tempData.checksum;
+    tempData.checksum = 0;
+  } else if constexpr (std::is_same<T, VitalSignsRecord>::value) {
+    receivedChecksum = tempData.checksum;
+    tempData.checksum = 0;
+  } else if constexpr (std::is_same<T, DeviceIdentityRecord>::value) {
+    receivedChecksum = tempData.checksum;
+    tempData.checksum = 0;
   }
 
   uint8_t calculatedChecksum = calculateChecksum(tempData);
   return (calculatedChecksum == receivedChecksum);
+}
+
+// Field time sync: a WeatherForecastUpdate carries Annabelle's time stamped for the end of its
+// transmit. 169 bytes at SF9/125 kHz is ~0.86 s on air, stamped just before beginPacket().
+#define WEATHER_AIRTIME_SEC 1
+
+// WEATHER_FLAG_DST when the TZ rule says daylight saving is in effect now (0 if NTP never set
+// the system clock). Re-asserts TZ first - see syncRtcFromNtp().
+uint8_t annabelleDstFlag() {
+  setenv("TZ", timezone.c_str(), 1);
+  tzset();
+  struct tm now;
+  if (!getLocalTime(&now, 0)) return 0;
+  return now.tm_isdst > 0 ? WEATHER_FLAG_DST : 0;
 }
 
 template <typename T>
@@ -277,6 +385,13 @@ int sendMessage(const T& inputData) {
   while (keepGoing) {
     cadResult = performCAD();
     if (cadResult == LORA_OK) {
+      if constexpr (std::is_same<T, WeatherForecastUpdate>::value) {
+        // Stamped here, after any CAD back-off, and the code calculated at that same time so
+        // receivers can check it without trusting their own clocks.
+        dataToSend.annabelleTime = (uint32_t)(timeManager.getTimeForCodeGeneration() + WEATHER_AIRTIME_SEC);
+        dataToSend.flags = annabelleDstFlag();
+        dataToSend.totpcode = secretManager.generateCodeAt(dataToSend.annabelleTime);
+      }
       LoRa.beginPacket();
       LoRa.write((uint8_t *)&dataToSend, sizeof(T));
       if (!LoRa.endPacket()) {
@@ -316,12 +431,30 @@ void processLora(int packetSize) {
   if (packetSize == sizeof(LangleyData)) {
     memset(&langleyData, 0, sizeof(LangleyData));
     LoRa.readBytes((uint8_t*)&langleyData, sizeof(LangleyData));
+    // Validate on the as-received bytes before touching anything else - rssi/snr live inside
+    // the checksummed range of the struct, and Langley_West's checksum was computed over what
+    // it actually transmitted, which can't include the receiver's own RSSI/SNR. Overwriting
+    // them first (as this used to do) made every checksum fail unconditionally, silently
+    // dropping every Langley packet - see conversation 2026-07-21.
+    bool checksumOk = validateChecksum(langleyData);
     langleyData.rssi = LoRa.packetRssi();
     langleyData.snr = LoRa.packetSnr();
-    dataManager.storeLangleyData(langleyData);
-    langleyDataNewData = true;
-    if (debug) Serial.print("received langleyData from ");
-    if (debug) Serial.println(langleyData.devicename);
+    if (debug) {
+      Serial.print("received langleyData from ");
+      Serial.print(langleyData.devicename);
+      Serial.print(" cksum=");
+      Serial.println(checksumOk ? "ok" : "BAD");
+    }
+    // Corrupt LoRa packets (weak-signal bit errors) can mangle the device name - e.g.
+    // "Langley_West" garbled to something else - which would otherwise silently create/update
+    // the wrong Telepathon DeneChain. Dropping on a bad checksum keeps this dynamic (new
+    // devices like a future "Langley_East" still register automatically, no allow-list needed)
+    // while rejecting whole packets whose bytes don't match what was actually transmitted -
+    // see conversation 2026-07-20.
+    if (checksumOk) {
+      dataManager.storeLangleyData(langleyData);
+      langleyDataNewData = true;
+    }
 
   } else if (packetSize == sizeof(GloriaTankFlowPumpData)) {
     memset(&gloriaTankFlowPumpData, 0, sizeof(GloriaTankFlowPumpData));
@@ -339,7 +472,7 @@ void processLora(int packetSize) {
     digitalStablesData.rssi = LoRa.packetRssi();
     digitalStablesData.snr = LoRa.packetSnr();
     dataManager.storeDigitalStablesData(digitalStablesData);
-    dataManager.printDigitalStablesData(digitalStablesData);
+    if (debug) dataManager.printDigitalStablesData(digitalStablesData);
     digitalStablesDataNewData = true;
     if (debug) Serial.print("received digitalStablesData from ");
     if (debug) Serial.print(digitalStablesData.devicename);
@@ -392,6 +525,43 @@ void processLora(int packetSize) {
       dataManager.storeCommaRecord(commaRecord);
       commaDataNewData = true;
     }
+
+  } else if (packetSize == sizeof(VitalSignsRecord)) {
+    // Sent by each device right after its data pulse - only the latest per device is kept
+    // (running totals), see VitalSignsStore.h. rssi/snr are Annabelle's own measurement of
+    // this packet, kept outside the checksummed record.
+    VitalSignsRecord vitalSignsRecord;
+    LoRa.readBytes((uint8_t*)&vitalSignsRecord, sizeof(VitalSignsRecord));
+    bool checksumOk = validateChecksum(vitalSignsRecord);
+    if (debug) {
+      Serial.print("VitalSigns seq=");
+      Serial.print(vitalSignsRecord.seq);
+      Serial.print(" resets=");
+      Serial.print(vitalSignsRecord.resetCount);
+      Serial.print(" cksum=");
+      Serial.println(checksumOk ? "ok" : "BAD");
+    }
+    if (checksumOk) {
+      vitalSignsStore.store(vitalSignsRecord, LoRa.packetRssi(), LoRa.packetSnr());
+    }
+
+  } else if (packetSize == sizeof(DeviceIdentityRecord)) {
+    // Product definition + running build, sent rarely (after a real reset, after
+    // SetProductDefinition, daily) - only the latest per device is kept, see DeviceIdentityStore.h.
+    DeviceIdentityRecord deviceIdentityRecord;
+    LoRa.readBytes((uint8_t*)&deviceIdentityRecord, sizeof(DeviceIdentityRecord));
+    bool checksumOk = validateChecksum(deviceIdentityRecord);
+    if (debug) {
+      Serial.print("DeviceIdentity build=");
+      Serial.print(deviceIdentityRecord.firmwareBuild);
+      Serial.print(" labelBuild=");
+      Serial.print(deviceIdentityRecord.labelBuild);
+      Serial.print(" cksum=");
+      Serial.println(checksumOk ? "ok" : "BAD");
+    }
+    if (checksumOk) {
+      deviceIdentityStore.store(deviceIdentityRecord, LoRa.packetRssi(), LoRa.packetSnr());
+    }
   }
 }
 
@@ -407,18 +577,31 @@ void IRAM_ATTR clockTick() {
   portEXIT_CRITICAL_ISR(&mux);
 }
 
-void onReceive(int packetSize) {
-  loraReceived = true;
-  loraPacketSize = packetSize;
+void IRAM_ATTR onLoraDio0() {
+  loraDio0Fired = true;
 }
 
 //
 // end of interrupt functions
 //
 
+// FastLED.show() must never run on two cores at once: the RMT driver returns an error for a
+// refresh started while the previous one is still sending, and FastLED's ESP_ERROR_CHECK turns
+// that into abort(). That was the 2026-10-05 19:46 PANIC (loop() -> updateStatusLeds() on core 1
+// while ledShowTask was animating on core 0). Every show goes through showLeds().
+SemaphoreHandle_t ledMutex = NULL;  // created in setup() right after FastLED.addLeds
+volatile bool runLedShow = false;   // set by loop(), cleared by ledShowTask when the animation ends
+
+void showLeds() {
+  if (ledMutex) xSemaphoreTake(ledMutex, portMAX_DELAY);
+  FastLED.show();
+  if (ledMutex) xSemaphoreGive(ledMutex);
+}
+
 // Updates the 3 status LEDs (leds[0..2]) based on current system state.
 // leds[3,5] are LoRa/weather activity LEDs; leds[4] is the Pi-AsyncData heartbeat.
 void updateStatusLeds() {
+  if (runLedShow) return;  // ledShowTask owns the strip during an animation
   // LED 0 — WiFi: green=internet ok, yellow=IP but ping failed, red=no connection
   if (wifiManager.getInternetAvailable()) {
     leds[0] = CRGB(0, 255, 0);
@@ -448,11 +631,10 @@ void updateStatusLeds() {
   } else {
     leds[4] = CRGB(255, 0, 0);
   }
-  FastLED.show();
+  showLeds();
 }
 
 TaskHandle_t ledShowTask = NULL;
-bool runLedShow = false;
 int ledShowDuration = 250;
 
 // Brightness follows a sine wave across the strip (sin8), so each LED's intensity
@@ -473,14 +655,14 @@ void performLedShow(int millisseconds) {
   while (currentMillis < startmillis + millisseconds) {
     startIndex += 4;  // slow, steady left-to-right wave motion
     FillLEDsFromPaletteColors(startIndex);
-    FastLED.show();
+    showLeds();
     delay(30);  // pace the animation so it's a smooth wave, not a flicker
     currentMillis = millis();
   }
   for (int i = 0; i < NUM_LEDS; i++) {
     leds[i] = CRGB(0, 0, 0);
   }
-  FastLED.show();
+  showLeds();
 }
 
 void ledShowTaskFunction(void* parameter) {
@@ -494,6 +676,7 @@ void ledShowTaskFunction(void* parameter) {
 }
 
 void centerText(String text, int y) {
+  weatherScreenShown = false;  // every other page draws its header with centerText()
   display.setTextSize(1);
   display.setTextColor(WHITE);
   int16_t x1, y1;
@@ -520,13 +703,18 @@ void formatRain(char* out, int size, double val) {
   }
 }
 
-void showWeatherForecast() {
-  WeatherForecast* forecasts = weatherForecastManager->getForecasts();
-  if (forecasts == nullptr) return;
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
+// Page header: device name, a space and the RTC time as hh:mm (the name is cut to 15 characters
+// so the line fits in 21 characters = 126 px).
+String titleWithTime(String name) {
+  char t[6];
+  snprintf(t, sizeof(t), "%02d:%02d", currentTimerRecord.hour, currentTimerRecord.minute);
+  if (name.length() > 15) name = name.substring(0, 15);
+  return name + " " + t;
+}
 
+// Weather page top line: Annabelle's RTC date and time. Redrawn every second by loop() while the
+// page is shown, so the OLED always shows the clock Annabelle is using.
+void drawWeatherTitle() {
   char title[22];
   snprintf(title, sizeof(title), "WF %d/%d/%02d %02d:%02d:%02d",
            currentTimerRecord.date,
@@ -535,8 +723,20 @@ void showWeatherForecast() {
            currentTimerRecord.hour,
            currentTimerRecord.minute,
            currentTimerRecord.second);
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
   display.setCursor(0, 0);
   display.print(title);
+}
+
+void showWeatherForecast() {
+  WeatherForecast* forecasts = weatherForecastManager->getForecasts();
+  if (forecasts == nullptr) return;
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  drawWeatherTitle();
 
   display.setCursor(0, 9);
   char buf[22];
@@ -572,11 +772,12 @@ void showWeatherForecast() {
   display.println(buf);
 
   display.display();
+  weatherScreenShown = true;
 }
 
 void showChinampaPage1() {
   display.clearDisplay();
-  centerText(chinampaData.devicename, 0);
+  centerText(titleWithTime(chinampaData.devicename), 0);
 
   display.setTextSize(1);
   display.setCursor(0, 10);
@@ -668,7 +869,7 @@ void showChinampaPage2() {
   display.clearDisplay();
   display.setTextSize(1);
   display.setCursor(0, 0);
-  centerText(chinampaData.devicename, 0);
+  centerText(titleWithTime(chinampaData.devicename), 0);
   display.setCursor(0, 10);
 
   if (chinampaData.sensorstatus[0]) {
@@ -691,7 +892,7 @@ void showChinampaPage2() {
 
 void showDigitalStablesDetail() {
   display.clearDisplay();
-  centerText(digitalStablesData.devicename, 0);
+  centerText(titleWithTime(digitalStablesData.devicename), 0);
   display.setTextSize(1);
   display.setCursor(0, 10);
 
@@ -740,7 +941,7 @@ void showDigitalStablesDetail() {
 
 void showCommaRecordPage() {
   display.clearDisplay();
-  centerText(commaRecord.devicename, 0);
+  centerText(titleWithTime(commaRecord.devicename), 0);
   display.setTextSize(1);
   display.setCursor(0, 10);
   display.print("V:");
@@ -758,7 +959,7 @@ void showCommaRecordPage() {
 
 void showLangleyPage() {
   display.clearDisplay();
-  centerText(langleyData.devicename, 0);
+  centerText(titleWithTime(langleyData.devicename), 0);
   display.setTextSize(1);
   display.setCursor(0, 12);
 
@@ -795,7 +996,7 @@ void showLangleyPage() {
 
 void showGenericReceivedData(String label, const char* deviceName, float rssi, float snr) {
   display.clearDisplay();
-  centerText(label, 0);
+  centerText(titleWithTime(label), 0);
   display.setTextSize(1);
   display.setCursor(0, 12);
   display.println(deviceName);
@@ -808,7 +1009,7 @@ void showGenericReceivedData(String label, const char* deviceName, float rssi, f
 
 void showUnidentifiedPage() {
   display.clearDisplay();
-  centerText("Unidentified", 0);
+  centerText(titleWithTime("Unidentified"), 0);
   display.setTextSize(1);
   display.setCursor(0, 20);
   display.print("loraPacketSize: ");
@@ -868,22 +1069,204 @@ void checkPiControlButton() {
   piControlLastState = piControlCurrentState;
 }
 
+const char* resetReasonToString(esp_reset_reason_t reason) {
+  switch (reason) {
+    case ESP_RST_POWERON: return "POWERON";    // power loss OR EN pin pulled low - the ESP32 can't tell them apart
+    case ESP_RST_EXT: return "EXT_PIN";        // not reported by the original ESP32 (EN resets show as POWERON)
+    case ESP_RST_SW: return "SW";              // ESP.restart()
+    case ESP_RST_PANIC: return "PANIC";        // crash / Guru Meditation
+    case ESP_RST_INT_WDT: return "INT_WDT";    // interrupt watchdog (ISR too long / interrupts blocked)
+    case ESP_RST_TASK_WDT: return "TASK_WDT";  // task watchdog
+    case ESP_RST_WDT: return "WDT";            // other watchdog
+    case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+    case ESP_RST_BROWNOUT: return "BROWNOUT";  // supply voltage dipped
+    case ESP_RST_SDIO: return "SDIO";
+    default: return "UNKNOWN";
+  }
+}
+
+// Called once in setup(), after LittleFS and the RTC are up. Appends one line to
+// RESET_LOG_FILE (keeping the last RESET_LOG_MAX_LINES): RTC time, reason, boot count,
+// and the uptime reached before this reset (or "?" when RTC memory didn't survive).
+void recordResetReason(RTCInfoRecord& now) {
+  resetReason = resetReasonToString(esp_reset_reason());
+
+  if (resetDiagMagic == RESET_DIAG_MAGIC) {
+    previousUptimeSeconds = resetDiagUptimeSeconds;
+    previousMinFreeHeap = resetDiagMinFreeHeap;
+    previousUptimeKnown = true;
+    resetDiagBootCount++;
+  } else {
+    resetDiagMagic = RESET_DIAG_MAGIC;
+    resetDiagBootCount = 1;
+  }
+  resetDiagUptimeSeconds = 0;
+  resetDiagMinFreeHeap = ESP.getMinFreeHeap();
+
+  char line[128];
+  snprintf(line, sizeof(line), "%04d-%02d-%02d %02d:%02d:%02d reason=%s boot=%lu prevUptime=%s prevMinHeap=%s",
+           now.year, now.month, now.date, now.hour, now.minute, now.second,
+           resetReason.c_str(), (unsigned long)resetDiagBootCount,
+           previousUptimeKnown ? String(previousUptimeSeconds).c_str() : "?",
+           previousUptimeKnown ? String(previousMinFreeHeap).c_str() : "?");
+
+  // Keep only the newest lines so the log can't grow without bound
+  String kept = "";
+  int lineCount = 0;
+  File in = LittleFS.open(RESET_LOG_FILE, "r");
+  if (in) {
+    String all = in.readString();
+    in.close();
+    int start = all.length();
+    while (start > 0 && lineCount < RESET_LOG_MAX_LINES - 1) {
+      int prev = all.lastIndexOf('\n', start - 2);
+      start = prev + 1;
+      lineCount++;
+      if (prev < 0) break;
+    }
+    kept = all.substring(start);
+  }
+  File out = LittleFS.open(RESET_LOG_FILE, "w");
+  if (out) {
+    out.print(kept);
+    out.println(line);
+    out.close();
+  }
+  if (debug) Serial.println(line);
+  recordCoreDump(now);
+}
+
+// Called from recordResetReason(). Never lets '|' or '#' through - they delimit the AsyncData line.
+// The dump itself is left in flash (the next panic overwrites it) so the full dump can still be read
+// out and opened with esp-coredump; LAST_CRASH_FILE holds the summary line plus a fingerprint of the
+// dump, so the same dump is reported once, not again on every boot.
+void recordCoreDump(RTCInfoRecord& now) {
+  String knownFingerprint = "";
+  File f = LittleFS.open(LAST_CRASH_FILE, "r");
+  if (f) {
+    lastCrash = f.readStringUntil('\n');
+    knownFingerprint = f.readStringUntil('\n');
+    f.close();
+    lastCrash.trim();
+    knownFingerprint.trim();
+  }
+  if (esp_core_dump_image_check() != ESP_OK) return;  // no (valid) dump in flash
+
+  esp_core_dump_summary_t* summary = (esp_core_dump_summary_t*)malloc(sizeof(esp_core_dump_summary_t));
+  if (summary == nullptr) return;
+  if (esp_core_dump_get_summary(summary) != ESP_OK) {
+    free(summary);
+    return;
+  }
+  // Fingerprint: dump size + crash pc + task + backtrace - identical on every boot for the same
+  // dump, different for a new crash.
+  size_t dumpAddr = 0, dumpSize = 0;
+  esp_core_dump_image_get(&dumpAddr, &dumpSize);
+  uint32_t fp = (uint32_t)dumpSize ^ summary->exc_pc ^ summary->exc_tcb;
+  for (uint32_t i = 0; i < summary->exc_bt_info.depth && i < 16; i++) fp = fp * 31 + summary->exc_bt_info.bt[i];
+  char fingerprint[12];
+  snprintf(fingerprint, sizeof(fingerprint), "%08lx", (unsigned long)fp);
+  if (knownFingerprint == fingerprint) {  // already reported
+    free(summary);
+    return;
+  }
+
+  char reason[200] = "";
+  if (esp_core_dump_get_panic_reason(reason, sizeof(reason)) != ESP_OK) strcpy(reason, "?");
+  char buf[64];
+  snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d;", now.year, now.month, now.date, now.hour, now.minute, now.second);
+  String line = String(buf) + reason + ";" + String(summary->exc_task) + ";";
+  snprintf(buf, sizeof(buf), "0x%08lx;", (unsigned long)summary->exc_pc);
+  line += buf;
+  for (uint32_t i = 0; i < summary->exc_bt_info.depth && i < 16; i++) {
+    snprintf(buf, sizeof(buf), "%s0x%08lx", i > 0 ? " " : "", (unsigned long)summary->exc_bt_info.bt[i]);
+    line += buf;
+  }
+  if (summary->exc_bt_info.corrupted) line += " (corrupted)";
+  line += ";";
+  for (int i = 0; i < 8 && summary->app_elf_sha256[i]; i++) line += (char)summary->app_elf_sha256[i];
+  // Registers: exception cause and address, a0 = return address of the crashing function (windowed
+  // ABI: top 2 bits are the call size, so restore the 0x4 code-segment prefix), and every EPC
+  // register the dump holds - when the panic started in an interrupt, an EPC holds the address of
+  // the code it interrupted.
+  const esp_core_dump_summary_extra_info_t& ex = summary->ex_info;
+  snprintf(buf, sizeof(buf), ";cause=%lu vaddr=0x%08lx a0=0x%08lx", (unsigned long)ex.exc_cause,
+           (unsigned long)ex.exc_vaddr, (unsigned long)((ex.exc_a[0] & 0x3FFFFFFFUL) | 0x40000000UL));
+  line += buf;
+  for (int i = 0; i < EPCx_REGISTER_COUNT; i++) {
+    if (!(ex.epcx_reg_bits & (1 << i))) continue;
+    snprintf(buf, sizeof(buf), " epc%d=0x%08lx", i + 1, (unsigned long)ex.epcx[i]);
+    line += buf;
+  }
+  free(summary);
+
+  line.replace("|", "/");
+  line.replace("#", "/");
+  line.replace("\n", " ");
+  line.replace("\r", " ");
+  lastCrash = line;
+
+  File out = LittleFS.open(LAST_CRASH_FILE, "w");
+  if (out) {
+    out.println(lastCrash);
+    out.println(fingerprint);
+    out.close();
+  }
+  File log = LittleFS.open(RESET_LOG_FILE, "a");
+  if (log) {
+    log.print("crash ");
+    log.println(lastCrash);
+    log.close();
+  }
+  if (debug) Serial.println("Core dump: " + lastCrash);
+}
+
+void printResetInfo() {
+  Serial.print("ResetReason=");
+  Serial.println(resetReason);
+  Serial.print("BootCount=");
+  Serial.println(resetDiagBootCount);
+  Serial.print("PrevUptimeSeconds=");
+  if (previousUptimeKnown) Serial.println(previousUptimeSeconds);
+  else Serial.println("?");
+  Serial.print("UptimeSeconds=");
+  Serial.println(millis() / 1000);
+  Serial.print("PrevMinFreeHeap=");
+  if (previousUptimeKnown) Serial.println(previousMinFreeHeap);
+  else Serial.println("?");
+  Serial.print("FreeHeap=");
+  Serial.println(ESP.getFreeHeap());
+  Serial.print("MinFreeHeap=");
+  Serial.println(ESP.getMinFreeHeap());
+  Serial.print("MaxAllocHeap=");
+  Serial.println(ESP.getMaxAllocHeap());
+  Serial.print("LastCrash=");
+  Serial.println(lastCrash.length() ? lastCrash : "none");
+  File in = LittleFS.open(RESET_LOG_FILE, "r");
+  if (in) {
+    while (in.available()) Serial.write(in.read());
+    in.close();
+  }
+}
+
 void setStationMode(String ipAddress) {
   if (debug) Serial.println("setting Station mode, address " + ipAddress);
   leds[0] = CRGB(0, 0, 255);
-  FastLED.show();
+  showLeds();
   display.clearDisplay();
   centerText("Station Mode", 0);
   display.setTextSize(1);
   display.setCursor(0, 20);
   display.println(ipAddress);
+  display.setCursor(0, 40);
+  display.println("Rst: " + resetReason);
   display.display();
   delay(2000);
 }
 
 void setApMode() {
   leds[0] = CRGB(0, 0, 255);
-  FastLED.show();
+  showLeds();
   if (debug) Serial.println("setting AP mode");
   String apAddress = wifiManager.getApAddress();
   if (debug) Serial.println("AP address " + apAddress);
@@ -892,11 +1275,70 @@ void setApMode() {
   display.setTextSize(1);
   display.setCursor(0, 20);
   display.println(apAddress);
+  display.setCursor(0, 40);
+  display.println("Rst: " + resetReason);
   display.display();
   delay(1000);
   leds[0] = CRGB(0, 255, 0);
   leds[1] = loraActive ? CRGB(0, 0, 255) : CRGB(255, 0, 0);
-  FastLED.show();
+  showLeds();
+}
+
+// Writes the PCF8563 time registers (0x02-0x08, BCD) directly. PCF8563TimeManager::setTime(String)
+// prints the date to Serial without a newline - that is the Pi's command line here - and
+// setTime(RTCInfoRecord) has no return statement, so neither is used.
+void writeRtc(const struct tm &t) {
+  auto bcd = [](int v) -> uint8_t { return (uint8_t)(((v / 10) << 4) | (v % 10)); };
+  Wire.beginTransmission(0x51);  // PCF8563
+  Wire.write(0x02);
+  Wire.write(bcd(t.tm_sec));
+  Wire.write(bcd(t.tm_min));
+  Wire.write(bcd(t.tm_hour));
+  Wire.write(bcd(t.tm_mday));
+  Wire.write(bcd(t.tm_wday));
+  Wire.write(bcd(t.tm_mon + 1));
+  Wire.write(bcd(t.tm_year - 100));
+  Wire.endTransmission();
+}
+
+// See RTC_SYNC_TOLERANCE_SEC. Does nothing until SNTP has synced (getLocalTime() is false before).
+void syncRtcFromNtp() {
+  // WifiManager::connectSTA() starts a task that calls configTime(36000, 3600, ...) on every
+  // connect, which replaces TZ with a fixed offset (no Australian DST rule) - possibly after the
+  // configTzTime() in setup(). Re-assert the real rule before reading local time.
+  setenv("TZ", timezone.c_str(), 1);
+  tzset();
+  struct tm ntp;
+  if (!getLocalTime(&ntp, 0)) return;  // 0 ms: never wait in loop()
+  rtcCheckedSinceBoot = true;
+  time_t ntpEpoch = time(nullptr);
+
+  struct tm rtc = {};
+  rtc.tm_year = currentTimerRecord.year - 1900;
+  rtc.tm_mon = currentTimerRecord.month - 1;
+  rtc.tm_mday = currentTimerRecord.date;
+  rtc.tm_hour = currentTimerRecord.hour;
+  rtc.tm_min = currentTimerRecord.minute;
+  rtc.tm_sec = currentTimerRecord.second;
+  rtc.tm_isdst = -1;  // let the TZ rule decide
+  long diff = (long)(ntpEpoch - mktime(&rtc));
+  if (labs(diff) <= RTC_SYNC_TOLERANCE_SEC) return;
+
+  char from[24];
+  snprintf(from, sizeof(from), "%04d-%02d-%02d %02d:%02d:%02d", currentTimerRecord.year, currentTimerRecord.month,
+           currentTimerRecord.date, currentTimerRecord.hour, currentTimerRecord.minute, currentTimerRecord.second);
+  writeRtc(ntp);
+  currentTimerRecord = timeManager.now();
+  char to[24];
+  snprintf(to, sizeof(to), "%04d-%02d-%02d %02d:%02d:%02d", currentTimerRecord.year, currentTimerRecord.month,
+           currentTimerRecord.date, currentTimerRecord.hour, currentTimerRecord.minute, currentTimerRecord.second);
+  String line = String("clock ") + from + " -> " + to + " (" + diff + " s, NTP" + (ntp.tm_isdst > 0 ? " AEDT)" : " AEST)");
+  if (debug) Serial.println(line);
+  File log = LittleFS.open(RESET_LOG_FILE, "a");
+  if (log) {
+    log.println(line);
+    log.close();
+  }
 }
 
 void setup() {
@@ -963,12 +1405,14 @@ void setup() {
   }
 
   FastLED.addLeds<WS2812, LED_PIN, GRB>(leds, NUM_LEDS);
+  ledMutex = xSemaphoreCreateMutex();
   FastLED.setBrightness(40);
   timeManager.start();
   timeManager.PCF8563osc1Hz();
   digitalWrite(RTC_CLK_OUT, HIGH);
   attachInterrupt(digitalPinToInterrupt(RTC_CLK_OUT), clockTick, RISING);
   currentTimerRecord = timeManager.now();
+  recordResetReason(currentTimerRecord);
 
   weatherForecastManager = new WeatherForecastManager(Serial, latitude, longitude, apiKey.c_str());
   weatherForecastManager->initialize(currentTimerRecord);
@@ -991,7 +1435,7 @@ void setup() {
   for (int i = 0; i < NUM_LEDS; i++) {
     leds[i] = CRGB(255, 255, 0);
   }
-  FastLED.show();
+  showLeds();
 
   display.clearDisplay();
   centerText("LoRa", 0);
@@ -1045,12 +1489,15 @@ void setup() {
     setApMode();
   }
 
+  configTzTime(timezone.c_str(), "pool.ntp.org", "time.google.com");  // SNTP; works once WiFi has internet
+
   internetAvailable = wifiManager.getInternetAvailable();
   if (debug) Serial.print(F("internet avail="));
   if (debug) Serial.println(internetAvailable);
 
   if (loraActive) {
-    LoRa.onReceive(onReceive);
+    // Not LoRa.onReceive() - see loraDio0Fired.
+    attachInterrupt(digitalPinToInterrupt(LORA_DI0), onLoraDio0, RISING);
     LoRa.receive();
   }
 
@@ -1083,10 +1530,24 @@ void loop() {
     timeIsSet = true;
     wifiManager.setCurrentTimerRecord(currentTimerRecord);
     secondsSinceLastAsyncData++;
+    resetDiagUptimeSeconds = millis() / 1000;  // RTC memory, read back after the next reset
+    resetDiagMinFreeHeap = ESP.getMinFreeHeap();
+    // Keeps DataManager's flash-wear rate estimate current without threading
+    // a time parameter through the whole enqueue/overflow call chain.
+    dataManager.setCurrentEpoch(TimeUtils::getEpochTime(currentTimerRecord.year, currentTimerRecord.month, currentTimerRecord.date, currentTimerRecord.hour, currentTimerRecord.minute, currentTimerRecord.second));
 
     hour = currentTimerRecord.hour;
     minute = currentTimerRecord.minute;
     second = currentTimerRecord.second;
+
+    if (second == 30 && (!rtcCheckedSinceBoot || minute == 7)) {
+      syncRtcFromNtp();
+    }
+    if (weatherScreenShown && !switchPositionLeft) {  // live clock on the weather page
+      display.fillRect(0, 0, SCREEN_WIDTH, 8, SSD1306_BLACK);
+      drawWeatherTitle();
+      display.display();
+    }
 
     // Set pending flag at trigger time; actual work deferred until serial is free
     if (minute % 5 == 0 && second == 0) {
@@ -1097,6 +1558,14 @@ void loop() {
       weatherPending = false;
       if (debug) Serial.println("About to get and send weatherforecasts");
       bool wifiAvail = wifiManager.getInternetAvailable();
+      if (!wifiAvail) {
+        // getInternetAvailable() only reflects the last ping; without an active
+        // recheck here, one failed ping (e.g. at boot, before DHCP/DNS settled)
+        // latches false forever and this 5-minute trigger never downloads again.
+        // Mirrors Daffodil.ino's recheck-on-reconnect handling.
+        wifiManager.checkInternetConnectionAvailable();
+        wifiAvail = wifiManager.getInternetAvailable();
+      }
       if (wifiAvail) {
         weatherDownloading = true;
         bool success = weatherForecastManager->downloadWeatherData();
@@ -1141,12 +1610,28 @@ void loop() {
     updateStatusLeds();  // refresh status LEDs every second
   }
 
+  if (loraDio0Fired) {
+    loraDio0Fired = false;
+    // Reads and clears the IRQ flags and points the FIFO at the packet; leaves the radio in standby
+    // after a packet, or switches it to single RX when there was none (CRC error, TX done).
+    int packetSize = LoRa.parsePacket();
+    if (packetSize > 0) {
+      loraPacketSize = packetSize;
+      loraReceived = true;
+    } else {
+      LoRa_rxMode();  // back to continuous receive
+    }
+  }
+
   if (loraReceived) {
     if (debug) Serial.printf("lora recive loraPacketSize: %d \n", loraPacketSize);
     if (debug) Serial.println("");
     processLora(loraPacketSize);
+    LoRa_rxMode();  // parsePacket() left the radio in standby
     loraReceived = false;
-    lastReceivedPacketSize = loraPacketSize;
+    // A VitalSigns (and sometimes a DeviceIdentity) packet follows a data pulse - keep showing
+    // that device's data page instead of switching to "Unidentified".
+    if (loraPacketSize != sizeof(VitalSignsRecord) && loraPacketSize != sizeof(DeviceIdentityRecord)) lastReceivedPacketSize = loraPacketSize;
     loraActivitySeconds = 3;
 
     currentPalette = loraReceivePalette;
@@ -1268,7 +1753,7 @@ void loop() {
       String hostname = generalFunctions.getValue(command, '#', 3);
       bool staok = wifiManager.configWifiSTA(ssid, password, hostname);
       leds[0] = staok ? CRGB(0, 0, 255) : CRGB(255, 0, 0);
-      FastLED.show();
+      showLeds();
       Serial.println("Ok-ConfigWifiSTA");
     } else if (command.startsWith("ConfigWifiAP")) {
       //ConfigWifiAP#soft_ap_ssid#soft_ap_password#hostname
@@ -1277,7 +1762,7 @@ void loop() {
       String hostname = generalFunctions.getValue(command, '#', 3);
       bool stat = wifiManager.configWifiAP(soft_ap_ssid, soft_ap_password, hostname);
       leds[0] = stat ? CRGB(0, 255, 0) : CRGB(255, 0, 0);
-      FastLED.show();
+      showLeds();
       Serial.println("Ok-ConfigWifiAP");
     } else if (command.startsWith("GetOperationMode")) {
       uint8_t switchState = digitalRead(OP_MODE);
@@ -1355,6 +1840,10 @@ void loop() {
       Serial.println(wifiManager.getIpAddress());
       Serial.println("Ok-GetIpAddress");
       Serial.flush();
+    } else if (command.startsWith("ResetInfo")) {
+      printResetInfo();
+      Serial.println("Ok-ResetInfo");
+      Serial.flush();
     } else if (command.startsWith("RestartWifi")) {
       wifiManager.restartWifi();
       Serial.println("Ok-restartWifi");
@@ -1363,40 +1852,162 @@ void loop() {
       DigitalStablesDataSerializer digitalStablesDataSerializer;
       digitalStablesDataSerializer.pushToSerial(Serial, digitalStablesData);
       Serial.flush();
+    } else if (command.startsWith("AsyncDataCount")) {
+      // Must be checked before "AsyncData" below (startsWith would match both).
+      // Non-destructive peek so the Pi knows how many lines to read before it
+      // actually asks for the data with AsyncData.
+      Serial.println(dataManager.getPendingQueueItemCount() + vitalSignsStore.pendingCount() + deviceIdentityStore.pendingCount());
+      //
+      // Per-type available/dropped/flash-health breakdown, added 2026-08-04
+      // for capacity planning as device counts grow (many Daffodils, several
+      // Langleys, etc). "available" is RAM-queue + flash-overflow combined;
+      // "dropped" is cumulative-since-boot records permanently lost (both
+      // tiers full); "flashHealthDays" is -1 when not applicable/not enough
+      // data yet.
+      //
+      Serial.print("QueueStatus#");
+      Serial.print("DS=");
+      Serial.print(dataManager.getDSDQueueCount() + dataManager.getDSDOverflowCount());
+      Serial.print(",");
+      Serial.print(dataManager.getDSDDroppedCount());
+      Serial.print(",");
+      Serial.print(dataManager.getDSDFlashHealthDaysRemaining());
+      Serial.print("|Gloria=");
+      Serial.print(dataManager.getGloriaQueueCount() + dataManager.getGloriaOverflowCount());
+      Serial.print(","); Serial.print(dataManager.getGloriaDroppedCount());
+      Serial.print(","); Serial.print(dataManager.getGloriaFlashHealthDaysRemaining());
+      Serial.print("|Seedling=");
+      Serial.print(dataManager.getSeedlingQueueCount() + dataManager.getSeedlingOverflowCount());
+      Serial.print(","); Serial.print(dataManager.getSeedlingDroppedCount());
+      Serial.print(","); Serial.print(dataManager.getSeedlingFlashHealthDaysRemaining());
+      Serial.print("|Chinampa=");
+      Serial.print(dataManager.getChinampaQueueCount() + dataManager.getChinampaOverflowCount());
+      Serial.print(","); Serial.print(dataManager.getChinampaDroppedCount());
+      Serial.print(","); Serial.print(dataManager.getChinampaFlashHealthDaysRemaining());
+      Serial.print("|Comma=");
+      Serial.print(dataManager.getCommaQueueCount() + dataManager.getCommaOverflowCount());
+      Serial.print(","); Serial.print(dataManager.getCommaDroppedCount());
+      Serial.print(","); Serial.print(dataManager.getCommaFlashHealthDaysRemaining());
+      Serial.print("|Langley=");
+      Serial.print(dataManager.getLangleyQueueCount() + dataManager.getLangleyOverflowCount());
+      Serial.print(","); Serial.print(dataManager.getLangleyDroppedCount());
+      Serial.print(","); Serial.print(dataManager.getLangleyFlashHealthDaysRemaining());
+      // Vital signs: RAM-only, latest per device, never dropped/flash - hence 0 and -1
+      Serial.print("|Vital="); Serial.print(vitalSignsStore.pendingCount());
+      Serial.print(",0,-1");
+      Serial.print("|Identity="); Serial.print(deviceIdentityStore.pendingCount());
+      Serial.println(",0,-1");
+      Serial.println("Ok-AsyncDataCount");
+      Serial.flush();
     } else if (command.startsWith("AsyncData")) {
       secondsSinceLastAsyncData = 0;
       currentPalette = asyncDataPalette;
       currentBlending = LINEARBLEND;
       ledShowDuration = 2000;
       runLedShow = true;
+      // Peeked before each process*Queue() drains it, so we can report how
+      // many records this call actually relayed -- see conversation
+      // 2026-08-04 (the "how many available vs downloaded" diagnostic).
+      int gloriaDownloaded = 0, dsDownloaded = 0, chinampaDownloaded = 0;
+      int seedlingDownloaded = 0, commaDownloaded = 0, langleyDownloaded = 0;
       if (gloriaTankFlowPumpNewData) {
+        gloriaDownloaded = dataManager.getGloriaQueueCount();
         dataManager.processGloriaQueue();
         gloriaTankFlowPumpNewData = false;
       }
       if (digitalStablesDataNewData) {
+        dsDownloaded = dataManager.getDSDQueueCount();
         dataManager.processDigitalStablesDataQueue();
         dataManager.clearAllDSDData();
         digitalStablesDataNewData = false;
       }
       if (chinampaDataNewData) {
+        chinampaDownloaded = dataManager.getChinampaQueueCount();
         dataManager.processChinampaDataQueue();
         dataManager.clearAllChinampaData();
         chinampaDataNewData = false;
       }
       if (seedlingMonitoringDataNewData) {
+        seedlingDownloaded = dataManager.getSeedlingQueueCount();
         dataManager.processSeedlingMonitorDataQueue();
         seedlingMonitoringDataNewData = false;
       }
       if (commaDataNewData) {
+        commaDownloaded = dataManager.getCommaQueueCount();
         dataManager.processCommaRecordQueue();
         dataManager.clearAllCommaRecords();
         commaDataNewData = false;
       }
+      // Overflow tiers are independent of the *NewData flags above (which
+      // only track "did a fresh LoRa packet arrive this cycle") -- overflow
+      // can hold backlog even when nothing new came in this cycle, so always
+      // check every type's overflow, not just when new data triggered the
+      // RAM path for that type.
+      int dsOverflowDownloaded = dataManager.getDSDOverflowCount();
+      dataManager.processDSDOverflow();
+      dsDownloaded += dsOverflowDownloaded;
+
+      int gloriaOverflowDownloaded = dataManager.getGloriaOverflowCount();
+      dataManager.processGloriaOverflow();
+      gloriaDownloaded += gloriaOverflowDownloaded;
+
+      int seedlingOverflowDownloaded = dataManager.getSeedlingOverflowCount();
+      dataManager.processSeedlingOverflow();
+      seedlingDownloaded += seedlingOverflowDownloaded;
+
+      int chinampaOverflowDownloaded = dataManager.getChinampaOverflowCount();
+      dataManager.processChinampaOverflow();
+      chinampaDownloaded += chinampaOverflowDownloaded;
+
+      int commaOverflowDownloaded = dataManager.getCommaOverflowCount();
+      dataManager.processCommaOverflow();
+      commaDownloaded += commaOverflowDownloaded;
       if (langleyDataNewData) {
+        langleyDownloaded = dataManager.getLangleyQueueCount();
         dataManager.processLangleyQueue();
         langleyDataNewData = false;
       }
-      Serial.println("Ok-AsyncData");
+      int langleyOverflowDownloaded = dataManager.getLangleyOverflowCount();
+      dataManager.processLangleyOverflow();
+      langleyDownloaded += langleyOverflowDownloaded;
+      // Counted in AsyncDataCount's total above, so AnnabelleReader's line bound includes them
+      int vitalDownloaded = vitalSignsStore.pushPendingToSerial(Serial);
+      int identityDownloaded = deviceIdentityStore.pushPendingToSerial(Serial);
+
+      Serial.print("Ok-AsyncData#");
+      Serial.print("DS="); Serial.print(dsDownloaded);
+      Serial.print("|Gloria="); Serial.print(gloriaDownloaded);
+      Serial.print("|Seedling="); Serial.print(seedlingDownloaded);
+      Serial.print("|Chinampa="); Serial.print(chinampaDownloaded);
+      Serial.print("|Comma="); Serial.print(commaDownloaded);
+      Serial.print("|Langley="); Serial.print(langleyDownloaded);
+      Serial.print("|Vital="); Serial.print(vitalDownloaded);
+      Serial.print("|Identity="); Serial.print(identityDownloaded);
+      //
+      // Reset diagnostics ride on the AsyncData terminator so the Hypothalamus
+      // records them every Async Cycle (generic to any microcontroller):
+      // ResetInfo=<reason>,<bootCount>,<prevUptimeSeconds or -1>,<uptimeSeconds>,
+      //           <freeHeap>,<minFreeHeap>,<maxAllocHeap>,<prevMinFreeHeap or -1>,
+      //           <RTC local time YYYYMMDDhhmmss>
+      // (heap in bytes; minFreeHeap falling day after day = leak/fragmentation)
+      //
+      Serial.print("|ResetInfo="); Serial.print(resetReason);
+      Serial.print(","); Serial.print(resetDiagBootCount);
+      Serial.print(","); Serial.print(previousUptimeKnown ? (long)previousUptimeSeconds : -1L);
+      Serial.print(","); Serial.print(millis() / 1000);
+      Serial.print(","); Serial.print(ESP.getFreeHeap());
+      Serial.print(","); Serial.print(ESP.getMinFreeHeap());
+      Serial.print(","); Serial.print(ESP.getMaxAllocHeap());
+      Serial.print(","); Serial.print(previousUptimeKnown ? (long)previousMinFreeHeap : -1L);
+      char rtcNow[16];  // the clock Annabelle runs on - the Hypothalamus compares it with its own
+      snprintf(rtcNow, sizeof(rtcNow), "%04d%02d%02d%02d%02d%02d", currentTimerRecord.year, currentTimerRecord.month,
+               currentTimerRecord.date, currentTimerRecord.hour, currentTimerRecord.minute, currentTimerRecord.second);
+      Serial.print(","); Serial.print(rtcNow);
+      // Last panic (from the core dump, see recordCoreDump) - only once there has been one.
+      if (lastCrash.length()) {
+        Serial.print("|Crash="); Serial.print(lastCrash);
+      }
+      Serial.println();
       Serial.flush();
     } else if (command.startsWith("GetLifeCycleData")) {
       Serial.println("Ok-GetLifeCycleData");
