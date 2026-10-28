@@ -1,4 +1,5 @@
 #include <LittleFS.h>
+#include "esp_heap_caps.h"
 #include "Arduino.h"
 #include <LoRa.h>
 #include <FastLED.h>
@@ -27,10 +28,21 @@
 #include <VitalSignsRecord.h>
 #include <VitalSignsStore.h>
 #include <DeviceIdentityStore.h>
+#include <PowerProfileRecord.h>
+#include <PowerProfileStore.h>
+#include <DeviceCommandRecord.h>
+#include <DeviceCommandQueue.h>
+#include "HeardEntry.h"
+#include <Preferences.h>
 #include <esp_system.h>
 #include <esp_core_dump.h>
 
 SET_LOOP_TASK_STACK_SIZE(16 * 1024);
+
+// Shown on the OLED at start-up, answered to the Pi's GetFirmware and in GetWebData (like Cleotilde).
+// Add 1 to firmwareVersion with every flashed change; the build time tells two builds of one version apart.
+const int firmwareVersion = 5;
+#define FIRMWARE_BUILD_TIME __DATE__ " " __TIME__
 
 // Display settings for 2.4" SSD1309 — same OLED hardware as Paula
 #define SCREEN_WIDTH 128
@@ -40,11 +52,30 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 #define SLEEP_SWITCH_26 26
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-const int SWITCH_PIN_LEFT = 32;
-const int SWITCH_PIN_RIGHT = 33;
+// TPL5010 hardware watchdog on the WallyI2CDataVisualizer shield (2026-10-22). The shield replaced
+// the one with the slide switch: Annabelle went dark several times after the Pi lost power and
+// nothing reset her. If DONE isn't pulsed within the TPL5010's period, its RSTN pulls EN low (JP3
+// closed) - a real hardware reset. watchdogTask (core 0) pulses DONE every second, but only while
+// loop() is alive, so a hung loop() still gets Annabelle reset. GPIO33 (WAKE) is left unused.
+#define WDT_DONE_PIN 25
+#define LED_POWER_PIN 23           // TPS2051B EN on the shield: HIGH powers the WS2812B LEDs (active high,
+                                   // despite the ~EN on the schematic symbol - Daffodil's LED_CONTROL too)
+#define WDT_SETUP_LIMIT_MS 180000UL  // setup() (WiFi scan and connect) may take this long
+#define WDT_LOOP_STALL_MS 90000UL    // loop() silent this long counts as hung (weather download < 30 s)
+volatile uint32_t loopAliveMs = 0;  // millis() at the top of the last loop() - 0 until setup() ends
+TaskHandle_t watchdogTaskHandle = NULL;
 
 #define LED_PIN 19
 #define NUM_LEDS 6
+TaskHandle_t ledShowTask = NULL;
+int ledShowDuration = 250;
+// FastLED.show() must never run on two cores at once: the RMT driver returns an error for a
+// refresh started while the previous one is still sending, and FastLED's ESP_ERROR_CHECK turns
+// that into abort(). That was the 2026-10-05 19:46 PANIC (loop() -> updateStatusLeds() on core 1
+// while ledShowTask was animating on core 0). Every show goes through showLeds().
+SemaphoreHandle_t ledMutex = NULL;  // created in setup() right after FastLED.addLeds
+volatile bool runLedShow = false;   // set by loop(), cleared by ledShowTask when the animation ends
+
 
 WeatherForecastManager* weatherForecastManager;
 
@@ -52,9 +83,24 @@ DataManager dataManager(Serial, LittleFS);
 ErrorManager errorManager;
 LoRaError cadResult;
 float avgRssi = 0;
-uint8_t loraActivitySeconds = 0;  // counts down each second; keeps leds[3,5] lit after a LoRa rx
-bool weatherDownloading = false;  // true while HTTP download is in progress
 bool weatherPending = false;      // set when trigger fires; runs when serial is free
+const char *weatherTrigger = "timer";  // who set weatherPending: "timer" or "web" (Send Now)
+
+// Weather on request (2026-10-13). The 5-minute broadcast reaches units that are awake; a sleeping
+// Daffodil is awake ~2 s per wake and almost never hears one, so its forecast goes stale. When its
+// pre-sleep data packet (sleepTime > 0) says the forecast is stale (opMode bit 1 clear), Annabelle
+// sends the cached forecast straight back: after that unit's VitalSigns, the last packet before it
+// listens (Daffodil.ino listenForWeatherReply), or WEATHER_REPLY_FALLBACK_MS after the data packet
+// if the VitalSigns doesn't arrive. No download - the cached forecast is at most 5 min old.
+#define WEATHER_REPLY_AFTER_VS_MS 100        // give the unit time to switch its radio to receive
+#define WEATHER_REPLY_FALLBACK_MS 2200       // data packet + 1 s gap + VitalSigns airtime + margin
+#define WEATHER_REPLY_MIN_GAP_MS 240000UL    // per unit: a unit that keeps rejecting it costs at most this often
+#define WEATHER_REPLY_UNITS 8
+bool weatherReplyPending = false;
+uint8_t weatherReplySerial[8];
+unsigned long weatherReplyDueMs = 0;
+struct WeatherReplyLog { uint8_t serial[8]; unsigned long ms; };
+WeatherReplyLog weatherReplyLog[WEATHER_REPLY_UNITS] = {};
 unsigned long secondsSinceLastAsyncData = 60;  // starts in the yellow band until the Pi's first AsyncData; counts up each second; reset when the Pi pulls data via AsyncData
 
 boolean debug = false;
@@ -141,7 +187,8 @@ struct LoRaPacketSizeCheck {
 constexpr size_t loraPacketSizes[] = {
   sizeof(LangleyData), sizeof(GloriaTankFlowPumpData), sizeof(DigitalStablesData), sizeof(ChinampaData),
   sizeof(SeedlingMonitorData), sizeof(CommaRecord), sizeof(VitalSignsRecord), sizeof(WeatherForecastUpdate),
-  sizeof(GraveyardShiftUpdate), sizeof(RequestCommand), sizeof(DeviceIdentityRecord)
+  sizeof(GraveyardShiftUpdate), sizeof(RequestCommand), sizeof(DeviceIdentityRecord),
+  sizeof(VitalSignsRecordV2), sizeof(VitalSignsRecordV3), sizeof(PowerProfileRecord), sizeof(DeviceCommandRecord)
 };
 static_assert(LoRaPacketSizeCheck::allDistinct(loraPacketSizes, sizeof(loraPacketSizes) / sizeof(loraPacketSizes[0]), 0, 1),
               "two LoRa packet structs have the same size - receivers dispatch on size, so they would be confused");
@@ -150,6 +197,8 @@ static_assert(LoRaPacketSizeCheck::allDistinct(loraPacketSizes, sizeof(loraPacke
 VitalSignsStore vitalSignsStore;
 // Latest DeviceIdentityRecord per device (product definition + running build), relayed the same way
 DeviceIdentityStore deviceIdentityStore;
+// Latest PowerProfileRecord per device (battery/sensor parameters for the Cerebellum's SOC), same way
+PowerProfileStore powerProfileStore;
 
 String serialNumber;
 uint8_t delayTime = 10;
@@ -186,7 +235,740 @@ volatile int loraPacketSize = 0;
 // when that collided with SPI use in loop() the board panicked with
 // "assert failed: xQueueSemaphoreTake queue.c:1718" (core dump 2026-10-05, every few minutes).
 volatile bool loraDio0Fired = false;
+volatile uint32_t loraDio0AtMs = 0;  // millis() when DIO0 last rose
+volatile bool ownTxDone = false;     // sendMessage() finished: the next empty parsePacket() is its TX-done
 int lastReceivedPacketSize = 0;
+
+// Radio listening statistics since boot (2026-10-15), served under "radio" on /Telepathons. TopTank's
+// packets were arriving only ~55% of the time at a strong signal (-76 dBm, SNR 11) with data and
+// VitalSigns lost at random - these measure how long Annabelle itself is not listening:
+//   busy    parsePacket() -> back in receive, in loraRxTask (since 2026-10-16 just the copy into rxSlots;
+//           before, all of processLora()). parsePacket() leaves the radio in standby, so a packet
+//           arriving while processLora() runs (flash writes included) is never heard at all.
+//   latency DIO0 -> parsePacket(). The radio is still receiving, but a second packet in that time
+//           replaces the first (DIO0 stays high, so no second interrupt - it can't be counted).
+//   tx      sendMessage(): CAD, back-offs and the transmit. txClobbered = a received packet still
+//           waiting to be read when a send started (the send overwrites it).
+//   noPacket DIO0 without a valid packet (CRC/header error) - our own TX-done is not counted.
+// Written by loraRxTask and loop() (same core); read by the async_tcp task without a lock (32-bit reads, a torn
+// snapshot only mixes two moments).
+struct RadioStats {
+  uint32_t rxPackets, noPacket;
+  uint32_t busyMsTotal, busyMsMax, busyOver1s;
+  uint32_t latencyMsTotal, latencyMsMax, latencyOver1s;
+  uint32_t txCount, txMsTotal, txMsMax, txClobbered;
+  uint32_t dio0Stuck;  // loraRxTask found DIO0 high with no interrupt pending and recovered
+  uint32_t rxDropped;  // packet read but the queue for loop() was full
+  // Where late reads come from (2026-10-16 evening: late reads and the average delay crept up
+  // after ~7 h): how long loraRxTask waited for loraMutex (held by sends), and the longest loop().
+  uint32_t lockWaitMsMax, lockWaitOver1s;
+  uint32_t loopMsMax, loopOver1s;
+  uint32_t wifiReconnects, wifiDownSecMax;  // WiFi watchdog (2026-10-17)
+};
+RadioStats radioStats = {};
+// Reset diagnostics are defined further down (near recordResetReason()); fillTelepathonsJson()
+// reports them.
+extern String resetReason;
+extern bool previousUptimeKnown;
+extern uint8_t previousLoopStage;
+const char *loopStageName(uint8_t s);
+// Fragmentation tracker data - see fragBegin()/fragEnd() further down
+#define FRAG_STAGES 13
+struct FragStat {
+  int32_t blockChange;  // bytes, summed over all runs of the step (negative = it shrank the block)
+  uint32_t runs;
+};
+FragStat fragStats[FRAG_STAGES] = {};
+uint32_t fragBootBlock = 0;
+
+// Radio and memory history: one snapshot every 10 minutes, the last 72 (12 h), served on
+// /RadioHistory for overnight analysis. Kept in RTC slow memory (RTC_DATA_ATTR), not DRAM, which is
+// full; cleared by a power-on reset. Heap values are in units of 16 bytes to fit uint16_t.
+#define RADIO_HISTORY_SLOTS 72
+#define RADIO_HISTORY_MS (10UL * 60UL * 1000UL)
+struct RadioHistoryRow {
+  uint32_t epoch;
+  uint16_t heapFree16, heapBlock16;  // free heap and largest free block, /16
+  uint16_t rx, noPacket, late;       // in these 10 minutes
+  uint16_t latencyAvgMs, loopMaxMs, lockWaitMaxMs;
+};
+// RTC_NOINIT (2026-10-17): survives crashes, watchdog and WiFi restarts - only a power-on clears it
+// (the magic is checked on the first radioHistoryTick()).
+#define RADIO_HISTORY_MAGIC 0x52484953
+RTC_NOINIT_ATTR RadioHistoryRow radioHistory[RADIO_HISTORY_SLOTS];
+RTC_NOINIT_ATTR uint8_t radioHistoryHead, radioHistoryCount;
+RTC_NOINIT_ATTR uint32_t radioHistoryMagic;
+uint32_t histLoopMaxMs = 0, histLockWaitMaxMs = 0;  // since the last snapshot
+
+// The last few noPacket events with the signal they came in at (2026-10-15): 28 of 88 packets
+// were arriving corrupted - the strength says whose they are (TopTank about -76 dBm, FISHTANK
+// about -107). Packet RSSI/SNR registers are set at RX done whatever the CRC says.
+#define CORRUPT_PACKETS_KEPT 8
+struct CorruptPacket {
+  uint32_t epoch;
+  int16_t rssi;
+  int8_t snrQ;  // SNR x 4
+};
+CorruptPacket corruptPackets[CORRUPT_PACKETS_KEPT] = {};
+uint8_t corruptPacketsHead = 0;  // next slot to write
+
+// Received packets, read out of the radio by loraRxTask the moment DIO0 rises (2026-10-16).
+// Before, loop() read the radio itself, and loop() is sometimes 1-4 s late (Pi serial commands,
+// weather download, web requests): the radio keeps receiving, so a second packet in that time
+// replaced the first - TopTank delivered ~50% at -72 dBm. loraRxTask (priority 3, core 1, above
+// loop()'s 1) reads within milliseconds whatever loop() is doing and queues the packet here;
+// loop() runs processLora() on it later, from rxPacketRead()/rxPacketRssi()/rxPacketSnr().
+// loraMutex: one user of the radio at a time - loraRxTask, or loop()'s sendMessage()/LoRa_rxMode().
+#define RX_SLOTS 4
+struct RxPacket {
+  uint8_t len;
+  int16_t rssi;
+  float snr;
+  uint8_t data[255];
+};
+RxPacket rxSlots[RX_SLOTS];
+volatile uint8_t rxHead = 0;  // written by loraRxTask
+volatile uint8_t rxTail = 0;  // written by loop()
+RxPacket *rxCurrent = nullptr;  // the packet processLora() is reading
+uint16_t rxCurrentPos = 0;
+int lastRxRssi = 0;      // last packet processed - for the OLED
+float lastRxSnr = 0;
+SemaphoreHandle_t loraMutex = nullptr;
+TaskHandle_t loraRxTaskHandle = nullptr;
+
+void loraLock() {
+  if (loraMutex) xSemaphoreTake(loraMutex, portMAX_DELAY);
+}
+void loraUnlock() {
+  if (loraMutex) xSemaphoreGive(loraMutex);
+}
+
+// processLora()'s replacement for LoRa.readBytes(): copies from the queued packet, zero-fills
+// past its end.
+size_t rxPacketRead(uint8_t *dst, size_t len) {
+  size_t n = 0;
+  while (n < len && rxCurrent && rxCurrentPos < rxCurrent->len) dst[n++] = rxCurrent->data[rxCurrentPos++];
+  while (n < len) dst[n++] = 0;
+  return len;
+}
+int rxPacketRssi() {
+  return rxCurrent ? rxCurrent->rssi : 0;
+}
+float rxPacketSnr() {
+  return rxCurrent ? rxCurrent->snr : 0;
+}
+
+// Last-heard table: one row per telepathon, updated by processLora() on every packet and served
+// as JSON for the web page (data/telepathons.js): /Telepathons has every row with its newest card,
+// /TelepathonHistory the cards kept for one row. A row is real once one of its packets checks out
+// - checksum, or for the types without one (Chinampa, Gloria, Seedling) a readable name and a
+// device clock within two days of real time. Everything else is junk: packets from a device whose
+// struct only shares its size with ours (FISHTANK, 2026-10-11), or weak-signal bit errors. A real
+// row keeps only the packets that checked out; the page piles the junk rows at the bottom. Rows are
+// matched by name, then by serial (VitalSigns/DeviceIdentity carry only a serial). RAM only - it
+// starts empty after a reset. heardMux guards it: processLora() runs in loop(), the web requests in
+// the async_tcp task.
+HeardEntry heard[MAX_HEARD];
+int heardCount = 0;
+portMUX_TYPE heardMux = portMUX_INITIALIZER_UNLOCKED;
+portMUX_TYPE webMux = portMUX_INITIALIZER_UNLOCKED;  // weatherStatus and the settings queue below
+
+// Commands for one device (2026-10-14) - so far a Daffodil's WiFi on/off from the web page. Held
+// and resent until the device's data shows the change (DeviceCommandQueue.h). Guarded by heardMux
+// like the rows it is shown on; transmitted from loop() only.
+DeviceCommandQueue deviceCommandQueue;
+
+// Outcome of the last WeatherForecastUpdate broadcast (5-minute timer, the Pi's getWF, or the
+// page's Send Now) - the weather line under the header of data/index.html. Written by
+// sendWeatherForecast() in loop(), read by the /Telepathons request, both under webMux.
+enum WeatherDownload : uint8_t { WEATHER_DL_OK = 1, WEATHER_DL_FAILED, WEATHER_DL_NO_INTERNET };
+#define WEATHER_NO_FORECAST -1  // WeatherSendStatus.lora: there was nothing to send
+struct WeatherSendStatus {
+  uint32_t epoch;     // Annabelle RTC, 0 = nothing sent since the reset
+  uint8_t download;   // WeatherDownload
+  int8_t lora;        // LoRaError from sendMessage(), or WEATHER_NO_FORECAST
+  uint8_t retries;    // CAD back-offs before it went out, or before giving up
+  char trigger[6];    // "timer", "Pi", "web"
+  WeatherForecast forecasts[4];
+};
+WeatherSendStatus weatherStatus = {};
+
+static bool serialIsSet(const uint8_t *s) {
+  for (int i = 0; i < 8; i++) if (s[i]) return true;
+  return false;
+}
+
+// The printable-ASCII start of a fixed-size name field, cut at the first byte that isn't - bit
+// errors behind a real name then land on the same row instead of making a new one.
+static void cleanName(const char *name, size_t nameLen, char out[17]) {
+  size_t n = 0;
+  if (name) {
+    while (n < nameLen && n < 16 && name[n] >= 0x20 && name[n] <= 0x7E) {
+      out[n] = name[n];
+      n++;
+    }
+  }
+  out[n] = '\0';
+}
+
+// A name somebody gave: at least 2 characters, all printable up to the terminator.
+static bool nameLooksReal(const char *name, size_t nameLen) {
+  size_t n = 0;
+  while (n < nameLen && name[n] != '\0') {
+    if (name[n] < 0x20 || name[n] > 0x7E) return false;
+    n++;
+  }
+  return n >= 2;
+}
+
+// Real Unix time from SNTP, 0 until it has synced. Device clocks (secondsTime) are Unix time;
+// Annabelle's own RTC epoch (heardNow) is local time counted as UTC.
+static uint32_t realNow() {
+  time_t t = time(nullptr);
+  return t > 1700000000 ? (uint32_t)t : 0;
+}
+
+// How far the device clock is ahead of real time, NAN when either clock is unknown.
+static float clockOffset(long deviceTime) {
+  uint32_t now = realNow();
+  if (!now || deviceTime <= 0) return NAN;
+  return (float)(deviceTime - (long)now);
+}
+
+// For packet types without a checksum.
+static bool plausible(const char *name, size_t nameLen, long deviceTime) {
+  if (!nameLooksReal(name, nameLen)) return false;
+  float off = clockOffset(deviceTime);
+  return isnan(off) || fabsf(off) < 2 * 86400;
+}
+
+static uint32_t heardNow() {
+  return (uint32_t)timeManager.getCurrentTimeInSeconds(currentTimerRecord);
+}
+
+// Finds (or creates) the row for a device. Call inside heardMux. name is cleaned, "" for
+// serial-only records. A serial-only record also matches a row with no name yet, and a named
+// packet adopts the unnamed row a VitalSigns made before its first data packet arrived. When the
+// table is full, the junk row heard from longest ago is reused, or failing that the oldest row.
+static HeardEntry *heardRow(const char *name, const uint8_t *serial) {
+  bool hasSerial = serial && serialIsSet(serial);
+  if (name[0]) {
+    for (int i = 0; i < heardCount; i++) {
+      if (strcmp(heard[i].name, name) == 0) return &heard[i];
+    }
+  }
+  for (int i = 0; i < heardCount; i++) {
+    if (name[0] && heard[i].name[0]) continue;
+    if (hasSerial ? memcmp(heard[i].serial, serial, 8) == 0 : (!name[0] && !serialIsSet(heard[i].serial))) return &heard[i];
+  }
+  int idx = heardCount;
+  if (heardCount < MAX_HEARD) {
+    heardCount++;
+  } else {
+    idx = -1;
+    for (int i = 0; i < MAX_HEARD; i++) {
+      if (heard[i].okCount == 0 && (idx < 0 || heard[i].lastEpoch < heard[idx].lastEpoch)) idx = i;
+    }
+    if (idx < 0) {
+      idx = 0;
+      for (int i = 1; i < MAX_HEARD; i++) if (heard[i].lastEpoch < heard[idx].lastEpoch) idx = i;
+    }
+  }
+  HeardEntry *e = &heard[idx];
+  uint16_t gen = e->gen + 1;
+  memset(e, 0, sizeof(HeardEntry));
+  e->gen = gen;
+  if (hasSerial) memcpy(e->serial, serial, 8);
+  return e;
+}
+
+// Weather/time-sync bookkeeping for a Daffodil or Langley data packet that checked out: its opMode
+// byte and clock offset. A jump of 10 s or more towards zero between two packets is taken as
+// the device setting its RTC from a WeatherForecastUpdate (Daffodil acceptAnnabelleTime corrects
+// anything over 5 s) - the device doesn't report the correction itself. Call inside heardMux.
+static void noteSync(HeardEntry *e, uint32_t epoch, int opMode, float off) {
+  bool fresh = opMode & 0x02;
+  if (fresh) {
+    if (!e->weatherFresh) e->weatherFreshSince = epoch;
+    e->weatherLastFresh = epoch;
+  }
+  e->weatherFresh = fresh;
+  e->weatherSeen = true;
+  if (isnan(off)) return;
+  // A timestamp more than a day off is a bad date in that one packet (TopTank sent dates in 2030-32
+  // with the right time of day, 2026-10-13), not the clock: skip it, so the next good packet isn't
+  // reported as a "correction" of a clock that was never wrong.
+  if (fabsf(off) > 86400) return;
+  if (e->offsetKnown && fabsf(off) <= fabsf(e->lastOffset) - 10) {
+    e->clockCorrectedAt = epoch;
+    e->clockCorrectedBy = e->lastOffset;
+  }
+  e->lastOffset = off;
+  e->offsetKnown = true;
+}
+
+// Records one packet on its device's row. kind null keeps the row's (serial-only records).
+static void noteCard(const char *rawName, size_t nameLen, const uint8_t *serial, const char *kind, HeardCardType type,
+                     bool ok, int rssi, float snr, const float *v, int nv) {
+  char name[17];
+  cleanName(rawName, nameLen, name);
+  HeardCard card;
+  card.epoch = heardNow();
+  card.type = type;
+  card.ok = ok;
+  card.rssi = rssi;
+  card.snr = snr;
+  for (int i = 0; i < CARD_VALUES; i++) card.v[i] = i < nv ? v[i] : NAN;
+
+  portENTER_CRITICAL(&heardMux);
+  HeardEntry *e = heardRow(name, serial);
+  if (name[0] && !e->name[0]) strcpy(e->name, name);
+  if (ok && serial && serialIsSet(serial)) memcpy(e->serial, serial, 8);
+  if (kind && (!e->kind[0] || type != CARD_VITAL)) strncpy(e->kind, kind, sizeof(e->kind) - 1);
+  e->lastEpoch = card.epoch;
+  e->rssi = rssi;
+  e->snr = snr;
+  if (ok) {
+    if (e->okCount++ == 0) e->histLen = e->histHead = 0;  // just became real: drop the junk cards
+  } else {
+    e->badCount++;
+  }
+  if (ok || e->okCount == 0) {
+    e->history[e->histHead] = card;
+    e->histHead = (e->histHead + 1) % HEARD_HISTORY;
+    if (e->histLen < HEARD_HISTORY) e->histLen++;
+  }
+  portEXIT_CRITICAL(&heardMux);
+}
+
+// Weather, clock and WiFi of a Daffodil or Langley data packet that checked out (page's Radio tab).
+static void noteSyncAndWifi(const char *rawName, size_t nameLen, const uint8_t *serial, int opMode, float offset, uint8_t wifiStatus) {
+  char name[17];
+  cleanName(rawName, nameLen, name);
+  portENTER_CRITICAL(&heardMux);
+  HeardEntry *e = heardRow(name, serial);
+  noteSync(e, heardNow(), opMode, offset);
+  e->wifiKnown = true;
+  e->wifiStatus = wifiStatus;
+  portEXIT_CRITICAL(&heardMux);
+}
+
+// The readings a Daffodil's function uses, in the order telepathons.js FUNCTIONS labels them, after
+// its board temperature and its outdoor temperature/humidity (the I2C sensor, any function - NAN when
+// the Daffodil reports -99, no sensor). NAN = unused slot. Same split as the Daffodil's own page (index.js refreshScreen).
+static void daffodilSensors(const DigitalStablesData &d, float out[DAFFODIL_SENSORS]) {
+  for (int i = 0; i < DAFFODIL_SENSORS; i++) out[i] = NAN;
+  out[0] = (int8_t)d.temperature;  // DS18B20 on the board, whole degrees (negative wraps in the uint8_t)
+  if (d.outdoortemperature != -99) { out[1] = d.outdoortemperature; out[2] = d.outdoorhumidity; }
+  float *f = out + 3;
+  switch (d.currentFunctionValue) {
+    case FUN_1_FLOW: f[0] = d.flowRate; f[1] = d.totalMilliLitres; break;
+    case FUN_2_FLOW: f[0] = d.flowRate; f[1] = d.totalMilliLitres; f[2] = d.flowRate2; f[3] = d.totalMilliLitres2; break;
+    case FUN_1_FLOW_1_TANK: f[0] = d.flowRate; f[1] = d.totalMilliLitres; f[2] = d.tank1PressurePsi; break;
+    case FUN_1_TANK: f[0] = d.tank1PressurePsi; break;
+    case FUN_2_TANK: f[0] = d.tank1PressurePsi; f[1] = d.tank2PressurePsi; break;
+    case DAFFODIL_SCEPTIC_TANK: f[0] = d.measuredHeight; f[1] = d.maximumScepticHeight; break;
+    case DAFFODIL_WATER_TROUGH: f[0] = d.measuredHeight; f[1] = d.troughlevelminimumcm; f[2] = d.troughlevelmaximumcm; break;
+    // DAFFODIL_TEMP_SOILMOISTURE: its outdoor temperature/humidity are already in out[1], out[2]
+    case VOLTAGE_MONITOR: f[0] = d.flowRate; break;  // the voltage on sensor 1 (Daffodil.ino reads it into flowRate)
+    case DAFFODIL_WATER_TROUGH_TANK1: f[0] = d.measuredHeight; f[1] = d.tank1PressurePsi; break;
+    case DAFFODIL_2_WATER_TROUGH: f[0] = d.measuredHeight; f[1] = d.measuredHeight2; break;
+    case DAFFODIL_WATER_TROUGH_WATER_TEMP: f[0] = d.measuredHeight; f[1] = d.measuredHeight2; break;  // measuredHeight2 is the water temperature
+  }
+}
+
+void noteDigitalStablesPacket(const DigitalStablesData &d, bool ok) {
+  float v[] = { d.batteryVoltage, d.batteryCurrent, d.panelVoltage, d.panelCurrent, d.v50Voltage,
+                (float)d.operatingStatus, (float)d.sleepTime, (float)d.opMode, clockOffset(d.secondsTime) };
+  static_assert(sizeof(v) / sizeof(v[0]) <= CARD_VALUES, "more values than a HeardCard holds");
+  noteCard(d.devicename, sizeof(d.devicename), d.serialnumberarray, "Daffodil", CARD_DAFFODIL, ok, (int)d.rssi, d.snr, v, 9);
+  if (ok) {
+    noteSyncAndWifi(d.devicename, sizeof(d.devicename), d.serialnumberarray, d.opMode, v[8], d.wifiStatus);
+    float sensors[DAFFODIL_SENSORS];
+    daffodilSensors(d, sensors);
+    char name[17];
+    cleanName(d.devicename, sizeof(d.devicename), name);
+    portENTER_CRITICAL(&heardMux);
+    HeardEntry *e = heardRow(name, d.serialnumberarray);
+    e->function = d.currentFunctionValue;
+    memcpy(e->sensors, sensors, sizeof(sensors));
+    portEXIT_CRITICAL(&heardMux);
+  }
+}
+
+void noteChinampaPacket(const ChinampaData &d, bool ok) {
+  float v[] = { d.fishTankMeasuredHeight, d.sumpTroughMeasuredHeight, d.rtcBatVolt, (float)d.microtemperature, d.lux,
+                (float)d.alertcode, clockOffset(d.secondsTime) };
+  static_assert(sizeof(v) / sizeof(v[0]) <= CARD_VALUES, "more values than a HeardCard holds");
+  noteCard(d.devicename, sizeof(d.devicename), d.serialnumberarray, "Chinampa", CARD_CHINAMPA, ok, (int)d.rssi, d.snr, v, 7);
+}
+
+void noteLangleyPacket(const LangleyData &d, bool ok) {
+  float v[] = { d.batteryVoltage, d.batteryCurrentMa, d.solarVoltage, d.solarCurrentMa, d.fenceVoltageAvg,
+                d.energizerBatteryVoltage, d.temperature, clockOffset(d.secondsTime), d.sleepTime };
+  static_assert(sizeof(v) / sizeof(v[0]) <= CARD_VALUES, "more values than a HeardCard holds");
+  noteCard(d.devicename, sizeof(d.devicename), d.serialnumberarray, "Langley", CARD_LANGLEY, ok, (int)d.rssi, d.snr, v, 9);
+  // sleepTime/wifiStatus/opMode since 2026-10-23 - older Langleys send 1800/3.75/3.25 there until reflashed
+  if (ok) noteSyncAndWifi(d.devicename, sizeof(d.devicename), d.serialnumberarray, (int)d.opMode, v[7], (uint8_t)d.wifiStatus);
+}
+
+void noteGloriaPacket(const GloriaTankFlowPumpData &d, bool ok) {
+  float v[] = { d.solarvoltage, d.capacitorvoltage, d.totalMilliLitres, d.totalMilliLitres2, (float)d.temperature, clockOffset(d.secondsTime) };
+  static_assert(sizeof(v) / sizeof(v[0]) <= CARD_VALUES, "more values than a HeardCard holds");
+  noteCard(d.devicename, sizeof(d.devicename), d.serialnumberarray, "Gloria", CARD_GLORIA, ok, (int)d.rssi, d.snr, v, 6);
+}
+
+void noteSeedlingPacket(const SeedlingMonitorData &d, bool ok) {
+  float v[] = { d.temperature, clockOffset(d.secondsTime) };
+  static_assert(sizeof(v) / sizeof(v[0]) <= CARD_VALUES, "more values than a HeardCard holds");
+  noteCard(d.devicename, sizeof(d.devicename), d.serialnumberarray, "Seedling", CARD_SEEDLING, ok, (int)d.rssi, d.snr, v, 2);
+}
+
+void noteVitalSignsPacket(const VitalSignsRecord &r, bool ok, int rssi, float snr) {
+  float v[] = { (float)r.resetCount, (float)r.seq, r.wakeVoltage_mV / 1000.0f, r.minVoltageSinceReport_mV / 1000.0f,
+                (float)r.txDurationMs, (float)r.loraTxFailCount, (float)r.lastWakeDriftSec, (float)r.lastAwakeSec,
+                (float)r.wakeCount };
+  static_assert(sizeof(v) / sizeof(v[0]) <= CARD_VALUES, "more values than a HeardCard holds");
+  noteCard(nullptr, 0, r.serialnumberarray, "Vital", CARD_VITAL, ok, rssi, snr, v, 9);
+}
+
+void noteIdentityPacket(const DeviceIdentityRecord &r, bool ok, int rssi, float snr) {
+  noteCard(nullptr, 0, r.serialnumberarray, nullptr, CARD_IDENTITY, ok, rssi, snr, nullptr, 0);
+}
+
+void noteCommaPacket(const CommaRecord &r, bool ok, int rssi, float snr) {
+  float v[] = { r.voltage, (float)r.index, (float)r.total };
+  static_assert(sizeof(v) / sizeof(v[0]) <= CARD_VALUES, "more values than a HeardCard holds");
+  noteCard(r.devicename, sizeof(r.devicename), r.serialnumber, nullptr, CARD_COMMA, ok, rssi, snr, v, 3);
+}
+
+void notePowerProfilePacket(const PowerProfileRecord &r, bool ok, int rssi, float snr) {
+  float v[] = { (float)r.capacity_mAh };
+  static_assert(sizeof(v) / sizeof(v[0]) <= CARD_VALUES, "more values than a HeardCard holds");
+  noteCard(nullptr, 0, r.serialnumberarray, nullptr, CARD_POWER, ok, rssi, snr, v, 1);
+}
+
+static void cardJson(JsonObject o, const HeardCard &c) {
+  o["t"] = c.epoch;
+  o["ty"] = c.type;
+  o["ok"] = c.ok;
+  o["rssi"] = c.rssi;
+  o["snr"] = c.snr;
+  JsonArray v = o["v"].to<JsonArray>();
+  int n = CARD_VALUES;
+  while (n > 0 && isnan(c.v[n - 1])) n--;
+  for (int i = 0; i < n; i++) v.add(c.v[i]);  // NAN serializes as null
+}
+
+static void weatherJson(JsonObject w) {
+  WeatherSendStatus s;
+  portENTER_CRITICAL(&webMux);
+  s = weatherStatus;
+  portEXIT_CRITICAL(&webMux);
+  w["pending"] = weatherPending;
+  if (!s.epoch) return;
+  w["t"] = s.epoch;
+  w["download"] = s.download;
+  w["lora"] = s.lora;
+  w["retries"] = s.retries;
+  w["maxRetries"] = MAX_RETRIES;
+  w["trigger"] = s.trigger;
+  if (s.lora == WEATHER_NO_FORECAST) return;
+  JsonArray fa = w["forecasts"].to<JsonArray>();
+  for (int i = 0; i < 4; i++) {
+    const WeatherForecast &f = s.forecasts[i];
+    JsonObject o = fa.add<JsonObject>();
+    o["t"] = f.secondsTime;  // Unix time
+    o["hour"] = f.hour;
+    o["temp"] = f.temperature;
+    o["cloud"] = f.cloudiness;
+    o["humidity"] = f.humidity;
+    o["pressure"] = f.pressure;
+    o["rain"] = f.rain;
+  }
+}
+
+// One row without its history - what /Telepathons sends.
+struct HeardSummary {
+  char name[17];
+  uint8_t serial[8];
+  char kind[12];
+  uint16_t gen;
+  uint32_t lastEpoch, okCount, badCount;
+  int16_t rssi;
+  float snr;
+  uint8_t histLen;
+  HeardCard front;
+  bool weatherSeen, weatherFresh, offsetKnown;
+  uint32_t weatherFreshSince, weatherLastFresh, clockCorrectedAt;
+  float lastOffset, clockCorrectedBy;
+  bool wifiKnown;
+  uint8_t wifiStatus;
+  // the row's last WiFi request - only what the page shows (a whole Slot per row overflowed DRAM)
+  uint8_t cmdState, cmdOn, cmdSends;
+  uint32_t cmdAgeSec;
+};
+
+// Static: these run only in the async_tcp task, one request at a time, and are too big for its stack.
+static HeardSummary heardSummaries[MAX_HEARD];
+static HeardCard historyCopy[HEARD_HISTORY];
+
+// Newest data packet (Daffodil..Seedling) and newest vital signs of a row, for the page's
+// Sensors/Power/Radio tabs - the front card alone is usually the vital signs a device sends 1 s
+// after its data, which hid the data. One row at a time under the lock, so only two cards of static
+// memory instead of two per row in heardSummaries.
+static HeardCard latestData, latestVital;
+static int8_t latestFunction;
+static float latestSensors[DAFFODIL_SENSORS];
+static void copyLatestCards(int row, uint16_t gen, bool &hasData, bool &hasVital) {
+  hasData = hasVital = false;
+  latestFunction = 0;
+  portENTER_CRITICAL(&heardMux);
+  const HeardEntry &e = heard[row];
+  if (e.gen == gen) {
+    latestFunction = e.function;
+    memcpy(latestSensors, e.sensors, sizeof(latestSensors));
+    for (int i = 0; i < e.histLen && !(hasData && hasVital); i++) {
+      const HeardCard &c = e.history[(e.histHead + HEARD_HISTORY - 1 - i) % HEARD_HISTORY];
+      if (!hasData && c.type >= CARD_DAFFODIL && c.type <= CARD_SEEDLING) { latestData = c; hasData = true; }
+      if (!hasVital && c.type == CARD_VITAL) { latestVital = c; hasVital = true; }
+    }
+  }
+  portEXIT_CRITICAL(&heardMux);
+}
+
+static void serialHex(const uint8_t *s, char out[17]) {
+  for (int b = 0; b < 8; b++) snprintf(out + b * 2, 3, "%02X", s[b]);
+}
+
+// /Telepathons JSON. Copies the rows under the lock, builds the JSON outside it.
+void fillTelepathonsJson(JsonDocument &json) {
+  int n;
+  portENTER_CRITICAL(&heardMux);
+  n = heardCount;
+  for (int i = 0; i < n; i++) {
+    const HeardEntry &e = heard[i];
+    HeardSummary &s = heardSummaries[i];
+    memcpy(s.name, e.name, sizeof(s.name));
+    memcpy(s.serial, e.serial, sizeof(s.serial));
+    memcpy(s.kind, e.kind, sizeof(s.kind));
+    s.gen = e.gen;
+    s.lastEpoch = e.lastEpoch;
+    s.okCount = e.okCount;
+    s.badCount = e.badCount;
+    s.rssi = e.rssi;
+    s.snr = e.snr;
+    s.histLen = e.histLen;
+    if (e.histLen) s.front = e.history[(e.histHead + HEARD_HISTORY - 1) % HEARD_HISTORY];
+    s.weatherSeen = e.weatherSeen;
+    s.weatherFresh = e.weatherFresh;
+    s.weatherFreshSince = e.weatherFreshSince;
+    s.weatherLastFresh = e.weatherLastFresh;
+    s.offsetKnown = e.offsetKnown;
+    s.lastOffset = e.lastOffset;
+    s.clockCorrectedAt = e.clockCorrectedAt;
+    s.clockCorrectedBy = e.clockCorrectedBy;
+    s.wifiKnown = e.wifiKnown;
+    s.wifiStatus = e.wifiStatus;
+    DeviceCommandQueue::Slot c = deviceCommandQueue.status(e.serial);
+    s.cmdState = c.state;
+    s.cmdOn = c.command == DEVICE_COMMAND_WIFI_ON;
+    s.cmdSends = c.sends > 255 ? 255 : c.sends;
+    s.cmdAgeSec = (millis() - c.createdMs) / 1000;
+  }
+  portEXIT_CRITICAL(&heardMux);
+
+  json["now"] = heardNow();
+  json["uptimeSec"] = millis() / 1000;
+  weatherJson(json["weather"].to<JsonObject>());
+  // Radio listening statistics since boot - see RadioStats. deafPct: share of the uptime the radio
+  // was not receiving (processing a packet, or sending).
+  JsonObject radio = json["radio"].to<JsonObject>();
+  radio["rxPackets"] = radioStats.rxPackets;
+  radio["noPacket"] = radioStats.noPacket;
+  radio["busyMsTotal"] = radioStats.busyMsTotal;
+  radio["busyMsMax"] = radioStats.busyMsMax;
+  radio["busyOver1s"] = radioStats.busyOver1s;
+  radio["latencyMsTotal"] = radioStats.latencyMsTotal;
+  radio["latencyMsMax"] = radioStats.latencyMsMax;
+  radio["latencyOver1s"] = radioStats.latencyOver1s;
+  radio["txCount"] = radioStats.txCount;
+  radio["txMsTotal"] = radioStats.txMsTotal;
+  radio["txMsMax"] = radioStats.txMsMax;
+  radio["txClobbered"] = radioStats.txClobbered;
+  radio["dio0Stuck"] = radioStats.dio0Stuck;
+  radio["rxDropped"] = radioStats.rxDropped;
+  radio["lockWaitMsMax"] = radioStats.lockWaitMsMax;
+  radio["lockWaitOver1s"] = radioStats.lockWaitOver1s;
+  radio["loopMsMax"] = radioStats.loopMsMax;
+  radio["loopOver1s"] = radioStats.loopOver1s;
+  radio["wifiReconnects"] = radioStats.wifiReconnects;
+  radio["wifiDownSecMax"] = radioStats.wifiDownSecMax;
+  radio["resetReason"] = resetReason;
+  radio["resetStage"] = previousUptimeKnown ? loopStageName(previousLoopStage) : "";
+  // Fragmentation by step: [name, total change of the largest free block in bytes, runs]
+  radio["fragBootBlock"] = fragBootBlock;
+  JsonArray frag = radio["frag"].to<JsonArray>();
+  for (int i = 1; i < FRAG_STAGES; i++) {
+    if (!fragStats[i].runs) continue;
+    JsonArray f = frag.add<JsonArray>();
+    f.add(loopStageName(i));
+    f.add(fragStats[i].blockChange);
+    f.add(fragStats[i].runs);
+  }
+  // Memory (2026-10-16): the /Telepathons reply gets cut off when no free block is big enough.
+  radio["heapFree"] = ESP.getFreeHeap();
+  radio["heapMin"] = ESP.getMinFreeHeap();
+  radio["heapBlock"] = (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+  // Fixed-memory web replies (AnnabelleWifiManager, 2026-10-17)
+  radio["replyPeak"] = (uint32_t)wifiManager.getReplyPeakBytes();
+  radio["arenaPeak"] = (uint32_t)wifiManager.getArenaPeakBytes();
+  radio["replyBusy"] = wifiManager.getReplyBusyRejects();
+  radio["replyTooBig"] = wifiManager.getReplyTooBig();
+  // Web gate (AnnabelleWifiManager, 2026-10-22): requests turned away so the page can't run memory out
+  radio["webBusy"] = wifiManager.getWebBusy();
+  radio["webLowMemory"] = wifiManager.getWebLowMemory();
+  uint32_t upMs = millis();
+  radio["deafPct"] = upMs ? round(1000.0 * (radioStats.busyMsTotal + radioStats.txMsTotal) / upMs) / 10.0 : 0;
+  // Last corrupted packets, newest first: [epoch, rssi dBm, snr dB]
+  JsonArray corrupt = radio["corrupt"].to<JsonArray>();
+  for (int i = 1; i <= CORRUPT_PACKETS_KEPT; i++) {
+    const CorruptPacket &c = corruptPackets[(corruptPacketsHead + CORRUPT_PACKETS_KEPT - i) % CORRUPT_PACKETS_KEPT];
+    if (!c.epoch) break;
+    JsonArray e = corrupt.add<JsonArray>();
+    e.add(c.epoch);
+    e.add(c.rssi);
+    e.add(c.snrQ / 4.0);
+  }
+  JsonArray rows = json["telepathons"].to<JsonArray>();
+  for (int i = 0; i < n; i++) {
+    HeardSummary &s = heardSummaries[i];
+    JsonObject r = rows.add<JsonObject>();
+    char sn[17];
+    serialHex(s.serial, sn);
+    r["row"] = i;
+    r["gen"] = s.gen;
+    r["name"] = s.name[0] ? s.name : sn;
+    r["serial"] = sn;
+    r["kind"] = s.kind;
+    r["real"] = s.okCount > 0;
+    r["okCount"] = s.okCount;
+    r["badCount"] = s.badCount;
+    r["lastEpoch"] = s.lastEpoch;
+    r["rssi"] = s.rssi;
+    r["snr"] = s.snr;
+    r["cards"] = s.histLen;
+    // Junk rows (no packet ever checked out) send no card - their names and counts are enough for
+    // the pile, and leaving 15+ junk cards out keeps this reply small enough to always fit in memory
+    // (2026-10-16: it was being cut off after several hours). Their cards stay on /TelepathonHistory.
+    if (s.histLen && s.okCount > 0) {
+      cardJson(r["front"].to<JsonObject>(), s.front);
+      // The newest data and vital signs cards when the front isn't already that card.
+      bool hasData, hasVital;
+      copyLatestCards(i, s.gen, hasData, hasVital);
+      if (hasData && latestData.type != s.front.type) cardJson(r["data"].to<JsonObject>(), latestData);
+      if (hasVital && s.front.type != CARD_VITAL) cardJson(r["vital"].to<JsonObject>(), latestVital);
+      // Daffodil function and its sensor readings (daffodilSensors), NAN -> null
+      if (latestFunction) {
+        r["fn"] = latestFunction;
+        JsonArray sv = r["sens"].to<JsonArray>();
+        int ns = DAFFODIL_SENSORS;
+        while (ns > 0 && isnan(latestSensors[ns - 1])) ns--;
+        for (int k = 0; k < ns; k++) sv.add(latestSensors[k]);
+      }
+    }
+    if (s.weatherSeen) {
+      JsonObject sy = r["sync"].to<JsonObject>();
+      sy["fresh"] = s.weatherFresh;
+      sy["freshSince"] = s.weatherFreshSince;
+      sy["lastFresh"] = s.weatherLastFresh;
+      if (s.offsetKnown) sy["offset"] = s.lastOffset;
+      if (s.clockCorrectedAt) {
+        sy["correctedAt"] = s.clockCorrectedAt;
+        sy["correctedBy"] = s.clockCorrectedBy;
+      }
+    }
+    // WiFi (Daffodils): last reported status (0 off, 1 own hotspot, 2 router, 3 router + internet)
+    // and the last on/off request from this page - state 1 waiting, 2 done, 3 gave up.
+    if (s.wifiKnown) {
+      JsonObject w = r["wifi"].to<JsonObject>();
+      w["status"] = s.wifiStatus;
+      if (s.cmdState != DEVICE_COMMAND_STATE_NONE) {
+        JsonObject c = w["cmd"].to<JsonObject>();
+        c["on"] = (bool)s.cmdOn;
+        c["state"] = s.cmdState;
+        c["sends"] = s.cmdSends;
+        c["ageSec"] = s.cmdAgeSec;
+      }
+    }
+  }
+}
+
+// /TelepathonHistory JSON: the row's cards, newest first. Empty when the row has since been
+// reused for another device (gen changed).
+void fillTelepathonHistoryJson(JsonDocument &json, int row, int gen) {
+  int n = 0;
+  portENTER_CRITICAL(&heardMux);
+  if (row >= 0 && row < heardCount && (gen < 0 || heard[row].gen == gen)) {
+    const HeardEntry &e = heard[row];
+    n = e.histLen;
+    for (int i = 0; i < n; i++) historyCopy[i] = e.history[(e.histHead + HEARD_HISTORY - 1 - i) % HEARD_HISTORY];
+  }
+  portEXIT_CRITICAL(&heardMux);
+
+  json["row"] = row;
+  json["gen"] = gen;
+  JsonArray cards = json["cards"].to<JsonArray>();
+  for (int i = 0; i < n; i++) cardJson(cards.add<JsonObject>(), historyCopy[i]);
+}
+
+// Settings page (data/settings.js -> AnnabelleWifiManager::setSettingsAction). The request arrives
+// in the async_tcp task; the RTC (I2C, shared with the OLED) and preferences are only touched from
+// loop(), so it is queued here and the page reads webResult back through GetWebData.
+enum WebAction : uint8_t { WEB_NONE, WEB_SET_TIME, WEB_SET_TIME_INTERNET, WEB_SET_GPS, WEB_SEND_WEATHER, WEB_DEVICE_WIFI };
+volatile uint8_t webAction = WEB_NONE;
+char webArgA[32], webArgB[32];
+char webResult[96] = "";
+float boardTemperature = NAN;  // Annabelle's DS18B20, read once a minute in loop()
+#define CONFIG_PREFS "annabelleCfg"
+
+String queueWebAction(const String &form, const String &a, const String &b) {
+  uint8_t action = form == "ManualSetTime" ? WEB_SET_TIME
+                 : form == "SetTimeViaInternet" ? WEB_SET_TIME_INTERNET
+                 : form == "SetGPS" ? WEB_SET_GPS
+                 : form == "SendWeatherNow" ? WEB_SEND_WEATHER
+                 : form == "DeviceWifi" ? WEB_DEVICE_WIFI
+                 : WEB_NONE;
+  if (action == WEB_NONE) return "";
+  portENTER_CRITICAL(&webMux);
+  bool busy = webAction != WEB_NONE;
+  if (!busy) {
+    strlcpy(webArgA, a.c_str(), sizeof(webArgA));
+    strlcpy(webArgB, b.c_str(), sizeof(webArgB));
+    webAction = action;
+  }
+  portEXIT_CRITICAL(&webMux);
+  return busy ? "Busy with the previous request - try again" : "Queued";
+}
+
+static void setWebResult(const String &text) {
+  portENTER_CRITICAL(&webMux);
+  strlcpy(webResult, text.c_str(), sizeof(webResult));
+  portEXIT_CRITICAL(&webMux);
+}
+
+void addWebDataExtras(DynamicJsonDocument &json) {
+  char result[sizeof(webResult)];
+  portENTER_CRITICAL(&webMux);
+  memcpy(result, webResult, sizeof(result));
+  portEXIT_CRITICAL(&webMux);
+  json["secondsTime"] = heardNow();  // local time counted as UTC - read it back with the UTC getters
+  json["firmware"] = "Version " + String(firmwareVersion) + " (" FIRMWARE_BUILD_TIME ")";
+  json["ntpSynced"] = realNow() != 0;
+  json["uptimeSec"] = millis() / 1000;
+  json["boardTemperature"] = boardTemperature;
+  json["settingsResult"] = result;
+}
 
 RTCInfoRecord lastReceptionRTCInfoRecord;
 
@@ -213,8 +995,9 @@ TBlendType currentBlending;
 // Distinct LED-show palettes so a LoRa reception looks different from a Pi AsyncData pull
 CRGBPalette16 loraReceivePalette(CRGB::Red, CRGB::HotPink, CRGB::LightPink, CRGB::White);
 CRGBPalette16 asyncDataPalette(CRGB::Yellow, CRGB::Orange, CRGB::Yellow, CRGB::Orange);
+// Same gradient as loraReceivePalette in blue: Annabelle sending a WeatherForecastUpdate
+CRGBPalette16 weatherSendPalette(CRGB::Blue, CRGB::DodgerBlue, CRGB::LightSkyBlue, CRGB::White);
 
-bool switchPositionLeft = true;  // left position = show received data, right position = show weather forecast
 bool weatherScreenShown = false;  // the weather page is on the OLED, so loop() may refresh its clock line (cleared by centerText())
 
 //
@@ -231,6 +1014,36 @@ RTC_NOINIT_ATTR uint32_t resetDiagMagic;
 RTC_NOINIT_ATTR uint32_t resetDiagBootCount;
 RTC_NOINIT_ATTR uint32_t resetDiagUptimeSeconds;
 RTC_NOINIT_ATTR uint32_t resetDiagMinFreeHeap;  // ESP.getMinFreeHeap() as of the last second before the reset
+// Where loop() was when the board reset (2026-10-17: an unexplained WDT reset at 06:54 after a
+// night of router trouble). Set with LOOP_STAGE() at each big step; read back after the reset.
+RTC_NOINIT_ATTR uint8_t resetDiagLoopStage;
+enum LoopStage : uint8_t {
+  STAGE_TOP = 1, STAGE_CLOCK, STAGE_WEB_ACTION, STAGE_WEATHER_DOWNLOAD, STAGE_WEATHER_TX, STAGE_DISPLAY,
+  STAGE_LORA, STAGE_COMMAND_TX, STAGE_WEATHER_REPLY, STAGE_SERIAL, STAGE_WIFI_RESTART, STAGE_ASYNCDATA
+};
+const char *loopStageName(uint8_t s) {
+  static const char *names[] = { "unknown", "loop top", "1 s clock work", "web settings action", "weather download",
+                                 "weather broadcast", "display", "LoRa packet", "device command send", "weather reply",
+                                 "Pi serial command", "restart: WiFi lost", "Pi data download (AsyncData)" };
+  return s < sizeof(names) / sizeof(names[0]) ? names[s] : "unknown";
+}
+#define LOOP_STAGE(s) (resetDiagLoopStage = (s))
+// Which loop() step fragments the heap (2026-10-17: the largest free block shrinks from ~51 KB at
+// boot while total free memory stays ~86 KB). fragBegin()/fragEnd() around each big step add the
+// change in the largest free block to that step's total; served as "frag" on /Telepathons. What
+// the steps don't explain happened elsewhere (web requests, WiFi, the LoRa task).
+uint32_t fragStartBlock = 0;
+static inline void fragBegin(uint8_t stage) {
+  LOOP_STAGE(stage);
+  fragStartBlock = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+}
+static inline void fragEnd(uint8_t stage) {
+  if (stage >= FRAG_STAGES) return;
+  fragStats[stage].blockChange += (int32_t)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) - (int32_t)fragStartBlock;
+  fragStats[stage].runs++;
+}
+uint8_t previousLoopStage = 0;  // resetDiagLoopStage as it was before this boot
+bool wifiStationWanted = false;  // station mode configured - set in setup(), used by wifiWatchdogTick()
 String resetReason = "";
 uint32_t previousUptimeSeconds = 0;
 uint32_t previousMinFreeHeap = 0;  // lowest free heap reached before the reset (0 = unknown) - a falling value points to a leak
@@ -315,6 +1128,12 @@ uint8_t calculateChecksum(const T& data) {
     checksumOffset = offsetof(VitalSignsRecord, checksum);
   } else if constexpr (std::is_same<T, DeviceIdentityRecord>::value) {
     checksumOffset = offsetof(DeviceIdentityRecord, checksum);
+  } else if constexpr (std::is_same<T, VitalSignsRecordV2>::value) {
+    checksumOffset = offsetof(VitalSignsRecordV2, checksum);
+  } else if constexpr (std::is_same<T, VitalSignsRecordV3>::value) {
+    checksumOffset = offsetof(VitalSignsRecordV3, checksum);
+  } else if constexpr (std::is_same<T, PowerProfileRecord>::value) {
+    checksumOffset = offsetof(PowerProfileRecord, checksum);
   }
 
   for (size_t i = 0; i < checksumOffset; i++) {
@@ -346,6 +1165,15 @@ bool validateChecksum(const T& receivedData) {
   } else if constexpr (std::is_same<T, DeviceIdentityRecord>::value) {
     receivedChecksum = tempData.checksum;
     tempData.checksum = 0;
+  } else if constexpr (std::is_same<T, VitalSignsRecordV2>::value) {
+    receivedChecksum = tempData.checksum;
+    tempData.checksum = 0;
+  } else if constexpr (std::is_same<T, VitalSignsRecordV3>::value) {
+    receivedChecksum = tempData.checksum;
+    tempData.checksum = 0;
+  } else if constexpr (std::is_same<T, PowerProfileRecord>::value) {
+    receivedChecksum = tempData.checksum;
+    tempData.checksum = 0;
   }
 
   uint8_t calculatedChecksum = calculateChecksum(tempData);
@@ -366,6 +1194,8 @@ uint8_t annabelleDstFlag() {
   return now.tm_isdst > 0 ? WEATHER_FLAG_DST : 0;
 }
 
+int lastSendRetries = 0;  // CAD back-offs in the last sendMessage(), for weatherStatus
+
 template <typename T>
 int sendMessage(const T& inputData) {
   T dataToSend = inputData;
@@ -377,6 +1207,8 @@ int sendMessage(const T& inputData) {
     dataToSend.checksum = 0;
     dataToSend.checksum = calculateChecksum(dataToSend);
   }
+  loraLock();  // loraRxTask finishes any packet it is reading first
+  if (loraDio0Fired) radioStats.txClobbered++;  // a received packet not yet read - the send replaces it
   LoRa_txMode();
   uint8_t result = 99;
   int retries = 0;
@@ -391,6 +1223,13 @@ int sendMessage(const T& inputData) {
         dataToSend.annabelleTime = (uint32_t)(timeManager.getTimeForCodeGeneration() + WEATHER_AIRTIME_SEC);
         dataToSend.flags = annabelleDstFlag();
         dataToSend.totpcode = secretManager.generateCodeAt(dataToSend.annabelleTime);
+      }
+      if constexpr (std::is_same<T, DeviceCommandRecord>::value) {
+        // Same rule as the forecast: the code is for the time stamped here, after any CAD back-off.
+        dataToSend.senderTime = (uint32_t)timeManager.getTimeForCodeGeneration();
+        dataToSend.totpcode = secretManager.generateCodeAt(dataToSend.senderTime);
+        dataToSend.sender = DEVICE_COMMAND_SENDER_ANNABELLE;
+        dataToSend.checksum = deviceCommandChecksum(dataToSend);
       }
       LoRa.beginPacket();
       LoRa.write((uint8_t *)&dataToSend, sizeof(T));
@@ -408,7 +1247,16 @@ int sendMessage(const T& inputData) {
       if (debug) Serial.print(retries + 1);
       if (debug) Serial.print(" of ");
       if (debug) Serial.println(MAX_RETRIES);
+      // Listen while backing off (2026-10-17). The radio used to sit in standby for the whole
+      // 0.5-1.5 s (doubling) back-off, so a packet arriving then was lost without trace - TopTank's
+      // VitalSigns, sent ~1-2.5 s after its data packet, kept landing in the back-off of the weather
+      // reply Annabelle queues for it (TX Fail Count 0, 7 of 47 reports lost). Back in receive mode
+      // with the lock released, loraRxTask takes anything that arrives; then try again.
+      LoRa_rxMode();
+      loraUnlock();
       delay(backoff);
+      loraLock();
+      LoRa_txMode();
       retries++;
       keepGoing = retries < MAX_RETRIES;
     } else {
@@ -417,11 +1265,137 @@ int sendMessage(const T& inputData) {
     }
   }
   if (result == 99) result = LORA_MAX_RETRIES_REACHED;
+  lastSendRetries = retries;
   if (debug) Serial.print("Lora returns ");
   if (debug) Serial.println(result);
+  // Our own TX-done raised DIO0. Leave loraDio0Fired set: loraRxTask's parsePacket() then clears ALL the
+  // IRQ flags - endPacket() clears only TX_DONE, and an RX_DONE left over from a packet that arrived
+  // just before this send keeps DIO0 high, so it never rises again and Annabelle hears nothing more
+  // (2026-10-15 22:39: clearing the flag here left the radio deaf all night). ownTxDone keeps that
+  // parsePacket() out of radioStats.noPacket.
+  if (result == LORA_OK || result == LORA_TX_FAILED) ownTxDone = true;  // a CAD give-up sent nothing
   LoRa_rxMode();
+  loraUnlock();
+  uint32_t txMs = millis() - startsendingtime;
+  radioStats.txCount++;
+  radioStats.txMsTotal += txMs;
+  if (txMs > radioStats.txMsMax) radioStats.txMsMax = txMs;
   msgCount++;
   return result;
+}
+
+// Downloads the forecast when there is internet and broadcasts its first 4 entries - also
+// Annabelle's field time sync (see WEATHER_AIRTIME_SEC). loop() only: LoRa/SPI must never be
+// touched from the async_tcp task (see loraDio0Fired). internetRechecks: extra pings before giving
+// up on the download - getInternetAvailable() only reflects the last ping, and one failed ping
+// (e.g. at boot, before DHCP/DNS settled) would otherwise latch false and stop every download.
+// Mirrors Daffodil.ino's recheck-on-reconnect handling. The outcome goes to weatherStatus.
+// Sends the 4 forecast entries as a WeatherForecastUpdate, with the blue LED show. loop() only.
+int broadcastForecast(WeatherForecast *forecasts) {
+  WeatherForecastUpdate weatherForecastUpdate;
+  for (int i = 0; i < 4; i++) weatherForecastUpdate.forecasts[i] = forecasts[i];
+  weatherForecastUpdate.totpcode = secretManager.generateCode();
+  if (debug) Serial.print("sending weather via LoRa, size=");
+  if (debug) Serial.println(sizeof(WeatherForecastUpdate));
+  currentPalette = weatherSendPalette;
+  currentBlending = LINEARBLEND;
+  ledShowDuration = 2000;
+  runLedShow = true;
+  return sendMessage(weatherForecastUpdate);  // ends in RX mode; loop polls for packets
+}
+
+// The weather-on-request reply (see weatherReplyPending): cached forecast, no download, and
+// weatherStatus (the page's "last broadcast" line) left alone.
+void sendWeatherReply() {
+  WeatherForecast *forecasts = weatherForecastManager->getForecasts();
+  if (forecasts == nullptr || !weatherForecastManager->hasValidForecasts()) return;
+  int result = broadcastForecast(forecasts);
+  if (debug) Serial.printf("weather reply sent, lora=%d\n", result);
+}
+
+// A Daffodil's or Langley's pre-sleep data packet with a stale forecast: queue a reply, unless this
+// unit got one in the last WEATHER_REPLY_MIN_GAP_MS.
+void queueWeatherReply(const uint8_t *serial, const char *name, long sleepTime, int opMode) {
+  if (sleepTime <= 0 || (opMode & 0x02) || !weatherForecastManager->hasValidForecasts()) return;
+  unsigned long now = millis();
+  int slot = -1, oldest = 0;
+  for (int i = 0; i < WEATHER_REPLY_UNITS; i++) {
+    if (memcmp(weatherReplyLog[i].serial, serial, 8) == 0) { slot = i; break; }
+    if (weatherReplyLog[i].ms < weatherReplyLog[oldest].ms) oldest = i;
+  }
+  if (slot >= 0 && weatherReplyLog[slot].ms != 0 && now - weatherReplyLog[slot].ms < WEATHER_REPLY_MIN_GAP_MS) return;
+  if (slot < 0) slot = oldest;
+  memcpy(weatherReplyLog[slot].serial, serial, 8);
+  weatherReplyLog[slot].ms = now;
+  memcpy(weatherReplySerial, serial, 8);
+  weatherReplyDueMs = now + WEATHER_REPLY_FALLBACK_MS;
+  weatherReplyPending = true;
+  if (debug) Serial.printf("weather reply queued for %.12s (stale forecast, sleeping %ld s)\n", name, sleepTime);
+}
+
+void sendWeatherForecast(int internetRechecks, const char *trigger) {
+  if (debug) Serial.println("About to get and send weatherforecasts");
+  // WiFi down (router out, 2026-10-17): no pings or downloads - each one waits for its timeouts
+  // inside loop(), which stalled loop() for minutes at a time overnight.
+  bool wifiUp = WiFi.status() == WL_CONNECTED;
+  bool wifiAvail = wifiUp && wifiManager.getInternetAvailable();
+  for (int i = 0; wifiUp && i < internetRechecks && !wifiAvail; i++) {
+    wifiManager.checkInternetConnectionAvailable();
+    wifiAvail = wifiManager.getInternetAvailable();
+  }
+  WeatherSendStatus s = {};
+  strlcpy(s.trigger, trigger, sizeof(s.trigger));
+  if (wifiAvail) {
+    LOOP_STAGE(STAGE_WEATHER_DOWNLOAD);
+    bool success = weatherForecastManager->downloadWeatherData();
+    LOOP_STAGE(STAGE_WEATHER_TX);
+    updateStatusLeds();
+    s.download = success ? WEATHER_DL_OK : WEATHER_DL_FAILED;
+    if (debug) Serial.println(success ? "Weather forecast downloaded" : "Weather forecast download failed");
+  } else {
+    s.download = WEATHER_DL_NO_INTERNET;
+    if (debug) Serial.println("No internet, skipping weather forecast download");
+  }
+  WeatherForecast* forecasts = weatherForecastManager->getForecasts();
+  if (forecasts != nullptr) {
+    for (int i = 0; i < 4; i++) s.forecasts[i] = forecasts[i];
+    s.lora = broadcastForecast(forecasts);
+    s.retries = lastSendRetries;
+  } else {
+    s.lora = WEATHER_NO_FORECAST;
+    if (debug) Serial.println("No forecast data available to send");
+  }
+  s.epoch = heardNow();
+  portENTER_CRITICAL(&webMux);
+  weatherStatus = s;
+  portEXIT_CRITICAL(&webMux);
+}
+
+// A VitalSigns record that arrived (v4, or v3 upgraded): relay table, web page, and - it is the
+// device's last packet before it listens - the timing of a weather reply or device command.
+void handleVitalSigns(const VitalSignsRecord &record, bool checksumOk) {
+  if (debug) {
+    Serial.print("VitalSigns v");
+    Serial.print(record.version);
+    Serial.print(" seq=");
+    Serial.print(record.seq);
+    Serial.print(" resets=");
+    Serial.print(record.resetCount);
+    Serial.print(" cksum=");
+    Serial.println(checksumOk ? "ok" : "BAD");
+  }
+  if (checksumOk) {
+    vitalSignsStore.store(record, rxPacketRssi(), rxPacketSnr());
+  }
+  noteVitalSignsPacket(record, checksumOk, rxPacketRssi(), rxPacketSnr());
+  if (checksumOk && weatherReplyPending && memcmp(record.serialnumberarray, weatherReplySerial, 8) == 0) {
+    weatherReplyDueMs = millis() + WEATHER_REPLY_AFTER_VS_MS;  // its last packet - it is listening now
+  }
+  if (checksumOk) {
+    portENTER_CRITICAL(&heardMux);
+    deviceCommandQueue.noteVitalSigns(record.serialnumberarray, millis());
+    portEXIT_CRITICAL(&heardMux);
+  }
 }
 
 void processLora(int packetSize) {
@@ -430,15 +1404,15 @@ void processLora(int packetSize) {
 
   if (packetSize == sizeof(LangleyData)) {
     memset(&langleyData, 0, sizeof(LangleyData));
-    LoRa.readBytes((uint8_t*)&langleyData, sizeof(LangleyData));
+    rxPacketRead((uint8_t*)&langleyData, sizeof(LangleyData));
     // Validate on the as-received bytes before touching anything else - rssi/snr live inside
     // the checksummed range of the struct, and Langley_West's checksum was computed over what
     // it actually transmitted, which can't include the receiver's own RSSI/SNR. Overwriting
     // them first (as this used to do) made every checksum fail unconditionally, silently
     // dropping every Langley packet - see conversation 2026-07-21.
     bool checksumOk = validateChecksum(langleyData);
-    langleyData.rssi = LoRa.packetRssi();
-    langleyData.snr = LoRa.packetSnr();
+    langleyData.rssi = rxPacketRssi();
+    langleyData.snr = rxPacketSnr();
     if (debug) {
       Serial.print("received langleyData from ");
       Serial.print(langleyData.devicename);
@@ -454,26 +1428,53 @@ void processLora(int packetSize) {
     if (checksumOk) {
       dataManager.storeLangleyData(langleyData);
       langleyDataNewData = true;
+      // Weather reply and WiFi commands, as for a Daffodil (Langley.ino since 2026-10-23)
+      queueWeatherReply(langleyData.serialnumberarray, langleyData.devicename,
+                        (long)langleyData.sleepTime, (int)langleyData.opMode);
+      portENTER_CRITICAL(&heardMux);
+      deviceCommandQueue.noteDataPacket(langleyData.serialnumberarray, (int)langleyData.wifiStatus != 0,
+                                        langleyData.sleepTime > 0, millis());
+      portEXIT_CRITICAL(&heardMux);
     }
+    noteLangleyPacket(langleyData, checksumOk);
 
   } else if (packetSize == sizeof(GloriaTankFlowPumpData)) {
     memset(&gloriaTankFlowPumpData, 0, sizeof(GloriaTankFlowPumpData));
-    LoRa.readBytes((uint8_t*)&gloriaTankFlowPumpData, sizeof(GloriaTankFlowPumpData));
-    gloriaTankFlowPumpData.rssi = LoRa.packetRssi();
-    gloriaTankFlowPumpData.snr = LoRa.packetSnr();
-    dataManager.storeGloria(gloriaTankFlowPumpData);
-    gloriaTankFlowPumpNewData = true;
+    rxPacketRead((uint8_t*)&gloriaTankFlowPumpData, sizeof(GloriaTankFlowPumpData));
+    gloriaTankFlowPumpData.rssi = rxPacketRssi();
+    gloriaTankFlowPumpData.snr = rxPacketSnr();
+    // No checksum in this struct: junk = name not printable or clock > 2 days off (plausible()).
+    bool ok = plausible(gloriaTankFlowPumpData.devicename, sizeof(gloriaTankFlowPumpData.devicename), gloriaTankFlowPumpData.secondsTime);
+    if (ok) {
+      dataManager.storeGloria(gloriaTankFlowPumpData);
+      gloriaTankFlowPumpNewData = true;
+    }
+    noteGloriaPacket(gloriaTankFlowPumpData, ok);
     if (debug) Serial.print("received GloriaTankFlowPumpData from ");
     if (debug) Serial.println(gloriaTankFlowPumpData.devicename);
 
   } else if (packetSize == sizeof(DigitalStablesData)) {
     memset(&digitalStablesData, 0, sizeof(DigitalStablesData));
-    LoRa.readBytes((uint8_t*)&digitalStablesData, sizeof(DigitalStablesData));
-    digitalStablesData.rssi = LoRa.packetRssi();
-    digitalStablesData.snr = LoRa.packetSnr();
-    dataManager.storeDigitalStablesData(digitalStablesData);
+    rxPacketRead((uint8_t*)&digitalStablesData, sizeof(DigitalStablesData));
+    // Checked on the bytes as received - rssi/snr are inside the checksummed range (see Langley
+    // above). Junk (bad checksum) is dropped here and never queued for the Pi (2026-10-13) - only
+    // counted on the web page. FISHTANK and SumpTrough pass; FISH (0 ok / 24 bad) does not.
+    bool checksumOk = validateChecksum(digitalStablesData);
+    digitalStablesData.rssi = rxPacketRssi();
+    digitalStablesData.snr = rxPacketSnr();
+    if (checksumOk) {
+      dataManager.storeDigitalStablesData(digitalStablesData);
+      digitalStablesDataNewData = true;
+      queueWeatherReply(digitalStablesData.serialnumberarray, digitalStablesData.devicename,
+                        digitalStablesData.sleepTime, digitalStablesData.opMode);
+      portENTER_CRITICAL(&heardMux);
+      deviceCommandQueue.noteDataPacket(digitalStablesData.serialnumberarray, digitalStablesData.wifiStatus != 0,
+                                        digitalStablesData.sleepTime > 0, millis());
+      portEXIT_CRITICAL(&heardMux);
+    }
+    noteDigitalStablesPacket(digitalStablesData, checksumOk);
+    if (debug && !checksumOk) Serial.println("digitalStablesData checksum BAD - dropped");
     if (debug) dataManager.printDigitalStablesData(digitalStablesData);
-    digitalStablesDataNewData = true;
     if (debug) Serial.print("received digitalStablesData from ");
     if (debug) Serial.print(digitalStablesData.devicename);
     if (debug) Serial.print(" ");
@@ -487,27 +1488,40 @@ void processLora(int packetSize) {
 
   } else if (packetSize == sizeof(ChinampaData)) {
     memset(&chinampaData, 0, sizeof(ChinampaData));
-    LoRa.readBytes((uint8_t*)&chinampaData, sizeof(ChinampaData));
-    chinampaData.rssi = LoRa.packetRssi();
-    chinampaData.snr = LoRa.packetSnr();
-    dataManager.storeChinampaData(chinampaData);
-    chinampaDataNewData = true;
+    rxPacketRead((uint8_t*)&chinampaData, sizeof(ChinampaData));
+    chinampaData.rssi = rxPacketRssi();
+    chinampaData.snr = rxPacketSnr();
+    // No checksum in this struct, and Chinampa must never be lost: junk = name not printable only.
+    // The clock is NOT checked (unlike Gloria/Seedling) - a drifted or reset Chinampa RTC must not
+    // drop its data. Since the 2026-10-13 restart: Chinampa 100 ok / 2 bad; 3 of 4 junk sources
+    // of this size had unreadable names.
+    bool ok = nameLooksReal(chinampaData.devicename, sizeof(chinampaData.devicename));
+    if (ok) {
+      dataManager.storeChinampaData(chinampaData);
+      chinampaDataNewData = true;
+    }
+    noteChinampaPacket(chinampaData, ok);
     if (debug) Serial.print("received chinampaData from ");
     if (debug) Serial.println(chinampaData.devicename);
 
   } else if (packetSize == sizeof(SeedlingMonitorData)) {
     memset(&seedlingMonitorData, 0, sizeof(SeedlingMonitorData));
-    LoRa.readBytes((uint8_t*)&seedlingMonitorData, sizeof(SeedlingMonitorData));
-    seedlingMonitorData.rssi = LoRa.packetRssi();
-    seedlingMonitorData.snr = LoRa.packetSnr();
-    dataManager.storeSeedlingMonitorData(seedlingMonitorData);
-    seedlingMonitoringDataNewData = true;
+    rxPacketRead((uint8_t*)&seedlingMonitorData, sizeof(SeedlingMonitorData));
+    seedlingMonitorData.rssi = rxPacketRssi();
+    seedlingMonitorData.snr = rxPacketSnr();
+    // No checksum in this struct: junk = name not printable or clock > 2 days off (plausible()).
+    bool ok = plausible(seedlingMonitorData.devicename, sizeof(seedlingMonitorData.devicename), seedlingMonitorData.secondsTime);
+    if (ok) {
+      dataManager.storeSeedlingMonitorData(seedlingMonitorData);
+      seedlingMonitoringDataNewData = true;
+    }
+    noteSeedlingPacket(seedlingMonitorData, ok);
     if (debug) Serial.print("received SeedlingMonitorData from ");
     if (debug) Serial.println(seedlingMonitorData.devicename);
 
   } else if (packetSize == sizeof(CommaRecord)) {
     memset(&commaRecord, 0, sizeof(CommaRecord));
-    LoRa.readBytes((uint8_t*)&commaRecord, sizeof(CommaRecord));
+    rxPacketRead((uint8_t*)&commaRecord, sizeof(CommaRecord));
     bool checksumOk = validateChecksum(commaRecord);
     if (debug) {
       Serial.print("CommaRecord from ");
@@ -525,31 +1539,28 @@ void processLora(int packetSize) {
       dataManager.storeCommaRecord(commaRecord);
       commaDataNewData = true;
     }
+    noteCommaPacket(commaRecord, checksumOk, rxPacketRssi(), rxPacketSnr());
 
   } else if (packetSize == sizeof(VitalSignsRecord)) {
     // Sent by each device right after its data pulse - only the latest per device is kept
     // (running totals), see VitalSignsStore.h. rssi/snr are Annabelle's own measurement of
     // this packet, kept outside the checksummed record.
     VitalSignsRecord vitalSignsRecord;
-    LoRa.readBytes((uint8_t*)&vitalSignsRecord, sizeof(VitalSignsRecord));
-    bool checksumOk = validateChecksum(vitalSignsRecord);
-    if (debug) {
-      Serial.print("VitalSigns seq=");
-      Serial.print(vitalSignsRecord.seq);
-      Serial.print(" resets=");
-      Serial.print(vitalSignsRecord.resetCount);
-      Serial.print(" cksum=");
-      Serial.println(checksumOk ? "ok" : "BAD");
-    }
-    if (checksumOk) {
-      vitalSignsStore.store(vitalSignsRecord, LoRa.packetRssi(), LoRa.packetSnr());
-    }
+    rxPacketRead((uint8_t*)&vitalSignsRecord, sizeof(VitalSignsRecord));
+    handleVitalSigns(vitalSignsRecord, validateChecksum(vitalSignsRecord));
+
+  } else if (packetSize == sizeof(VitalSignsRecordV3)) {
+    // Version 3 vital signs (89 bytes, no WiFi totals) from a device not yet reflashed with v4 -
+    // upgraded (WiFi totals zero) and handled like any other record, weather reply timing included.
+    VitalSignsRecordV3 v3;
+    rxPacketRead((uint8_t*)&v3, sizeof(VitalSignsRecordV3));
+    handleVitalSigns(vitalSignsFromV3(v3), validateChecksum(v3));
 
   } else if (packetSize == sizeof(DeviceIdentityRecord)) {
     // Product definition + running build, sent rarely (after a real reset, after
     // SetProductDefinition, daily) - only the latest per device is kept, see DeviceIdentityStore.h.
     DeviceIdentityRecord deviceIdentityRecord;
-    LoRa.readBytes((uint8_t*)&deviceIdentityRecord, sizeof(DeviceIdentityRecord));
+    rxPacketRead((uint8_t*)&deviceIdentityRecord, sizeof(DeviceIdentityRecord));
     bool checksumOk = validateChecksum(deviceIdentityRecord);
     if (debug) {
       Serial.print("DeviceIdentity build=");
@@ -560,8 +1571,41 @@ void processLora(int packetSize) {
       Serial.println(checksumOk ? "ok" : "BAD");
     }
     if (checksumOk) {
-      deviceIdentityStore.store(deviceIdentityRecord, LoRa.packetRssi(), LoRa.packetSnr());
+      deviceIdentityStore.store(deviceIdentityRecord, rxPacketRssi(), rxPacketSnr());
     }
+    noteIdentityPacket(deviceIdentityRecord, checksumOk, rxPacketRssi(), rxPacketSnr());
+
+  } else if (packetSize == sizeof(VitalSignsRecordV2)) {
+    // Version 2 vital signs (69 bytes, no battery ledger) from a device not yet reflashed with v3 -
+    // upgraded to the v3 layout (ledger zero, no temperature) and relayed like any other record.
+    VitalSignsRecordV2 v2;
+    rxPacketRead((uint8_t*)&v2, sizeof(VitalSignsRecordV2));
+    bool checksumOk = validateChecksum(v2);
+    if (debug) {
+      Serial.print("VitalSigns v2 cksum=");
+      Serial.println(checksumOk ? "ok" : "BAD");
+    }
+    if (checksumOk) {
+      VitalSignsRecord upgraded = vitalSignsFromV2(v2);
+      vitalSignsStore.store(upgraded, rxPacketRssi(), rxPacketSnr());
+    }
+    noteVitalSignsPacket(vitalSignsFromV2(v2), checksumOk, rxPacketRssi(), rxPacketSnr());
+
+  } else if (packetSize == sizeof(PowerProfileRecord)) {
+    // Battery/sensor parameters, sent after a real reset and daily - latest per device, see PowerProfileStore.h.
+    PowerProfileRecord powerProfileRecord;
+    rxPacketRead((uint8_t*)&powerProfileRecord, sizeof(PowerProfileRecord));
+    bool checksumOk = validateChecksum(powerProfileRecord);
+    if (debug) {
+      Serial.print("PowerProfile capacity=");
+      Serial.print(powerProfileRecord.capacity_mAh);
+      Serial.print(" cksum=");
+      Serial.println(checksumOk ? "ok" : "BAD");
+    }
+    if (checksumOk) {
+      powerProfileStore.store(powerProfileRecord, rxPacketRssi(), rxPacketSnr());
+    }
+    notePowerProfilePacket(powerProfileRecord, checksumOk, rxPacketRssi(), rxPacketSnr());
   }
 }
 
@@ -578,19 +1622,85 @@ void IRAM_ATTR clockTick() {
 }
 
 void IRAM_ATTR onLoraDio0() {
+  loraDio0AtMs = millis();
   loraDio0Fired = true;
+  BaseType_t woken = pdFALSE;
+  if (loraRxTaskHandle) vTaskNotifyGiveFromISR(loraRxTaskHandle, &woken);
+  if (woken) portYIELD_FROM_ISR();
+}
+
+// Reads every packet out of the radio as soon as DIO0 rises (see rxSlots). Also the safety net
+// for a stuck DIO0 (high with no interrupt pending - an IRQ flag left set, so it never rises
+// again): checked every 20 ms.
+void loraRxTask(void *arg) {
+  for (;;) {
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20));
+    if (!loraDio0Fired && digitalRead(LORA_DI0) == LOW) continue;
+    uint32_t lockStartMs = millis();
+    loraLock();  // waits while loop() is sending
+    uint32_t lockWaitMs = millis() - lockStartMs;
+    if (lockWaitMs > radioStats.lockWaitMsMax) radioStats.lockWaitMsMax = lockWaitMs;
+    if (lockWaitMs > histLockWaitMaxMs) histLockWaitMaxMs = lockWaitMs;
+    if (lockWaitMs > 1000) radioStats.lockWaitOver1s++;
+    bool fired = loraDio0Fired;
+    if (!fired && digitalRead(LORA_DI0) == LOW) {  // a send cleared it meanwhile
+      loraUnlock();
+      continue;
+    }
+    if (!fired) {
+      radioStats.dio0Stuck++;
+      loraDio0AtMs = millis();
+    }
+    loraDio0Fired = false;
+    bool afterOwnTx = ownTxDone;
+    ownTxDone = false;
+    uint32_t parseMs = millis();
+    if (!afterOwnTx) {
+      uint32_t latencyMs = parseMs - loraDio0AtMs;
+      radioStats.latencyMsTotal += latencyMs;
+      if (latencyMs > radioStats.latencyMsMax) radioStats.latencyMsMax = latencyMs;
+      if (latencyMs > 1000) radioStats.latencyOver1s++;
+    }
+    // Reads and clears the IRQ flags and points the FIFO at the packet; leaves the radio in standby
+    // after a packet, or switches it to single RX when there was none (CRC error, TX done).
+    int packetSize = LoRa.parsePacket();
+    if (packetSize > 0) {
+      radioStats.rxPackets++;
+      uint8_t next = (rxHead + 1) % RX_SLOTS;
+      if (next == rxTail) {
+        radioStats.rxDropped++;  // loop() hasn't caught up - the packet is lost
+      } else {
+        RxPacket &p = rxSlots[rxHead];
+        p.len = (uint8_t)min(packetSize, (int)sizeof(p.data));
+        LoRa.readBytes(p.data, p.len);
+        p.rssi = (int16_t)LoRa.packetRssi();
+        p.snr = LoRa.packetSnr();
+        rxHead = next;
+      }
+      LoRa_rxMode();  // straight back to listening
+      uint32_t busyMs = millis() - parseMs;
+      radioStats.busyMsTotal += busyMs;
+      if (busyMs > radioStats.busyMsMax) radioStats.busyMsMax = busyMs;
+      if (busyMs > 1000) radioStats.busyOver1s++;
+    } else if (afterOwnTx) {
+      LoRa_rxMode();  // our own TX-done - back to continuous receive
+    } else {
+      radioStats.noPacket++;
+      CorruptPacket &c = corruptPackets[corruptPacketsHead];
+      c.epoch = heardNow();
+      c.rssi = (int16_t)LoRa.packetRssi();
+      c.snrQ = (int8_t)constrain(lroundf(LoRa.packetSnr() * 4), -128, 127);
+      corruptPacketsHead = (corruptPacketsHead + 1) % CORRUPT_PACKETS_KEPT;
+      LoRa_rxMode();  // back to continuous receive
+    }
+    loraUnlock();
+  }
 }
 
 //
 // end of interrupt functions
 //
 
-// FastLED.show() must never run on two cores at once: the RMT driver returns an error for a
-// refresh started while the previous one is still sending, and FastLED's ESP_ERROR_CHECK turns
-// that into abort(). That was the 2026-10-05 19:46 PANIC (loop() -> updateStatusLeds() on core 1
-// while ledShowTask was animating on core 0). Every show goes through showLeds().
-SemaphoreHandle_t ledMutex = NULL;  // created in setup() right after FastLED.addLeds
-volatile bool runLedShow = false;   // set by loop(), cleared by ledShowTask when the animation ends
 
 void showLeds() {
   if (ledMutex) xSemaphoreTake(ledMutex, portMAX_DELAY);
@@ -600,6 +1710,8 @@ void showLeds() {
 
 // Updates the 3 status LEDs (leds[0..2]) based on current system state.
 // leds[3,5] are LoRa/weather activity LEDs; leds[4] is the Pi-AsyncData heartbeat.
+// Status on the first 3 LEDs only (2026-10-22): on the WallyI2CDataVisualizer shield in use, the
+// chain is broken after LED 3 (hardware), so LEDs 3-5 stay dark. The LED show still drives all 6.
 void updateStatusLeds() {
   if (runLedShow) return;  // ledShowTask owns the strip during an animation
   // LED 0 — WiFi: green=internet ok, yellow=IP but ping failed, red=no connection
@@ -612,30 +1724,20 @@ void updateStatusLeds() {
   }
   // LED 1 — LoRa
   leds[1] = loraActive ? CRGB(0, 255, 0) : CRGB(255, 0, 0);
-  // LED 2 — weather data: green=data available, red=no data yet
-  leds[2] = weatherForecastManager->hasValidForecasts() ? CRGB(0, 255, 0) : CRGB(255, 0, 0);
-  // LEDs 3,5 — activity: blue=downloading, green=recent LoRa rx (stays 3s), off otherwise
-  if (weatherDownloading) {
-    leds[3] = leds[5] = CRGB(0, 150, 255);
-  } else if (loraActivitySeconds > 0) {
-    leds[3] = leds[5] = CRGB(0, 255, 0);
-    loraActivitySeconds--;
-  } else {
-    leds[3] = leds[5] = CRGB(0, 0, 0);
-  }
-  // LED 4 — time since the Pi last pulled data via AsyncData: green <1min, yellow <2min, red otherwise
+  // LED 2 — Hypothalamus: time since the Pi last pulled data via AsyncData - green <2.5 min,
+  // yellow <4 min, red otherwise
   if (secondsSinceLastAsyncData < 150) {
-    leds[4] = CRGB(0, 255, 0);
+    leds[2] = CRGB(0, 255, 0);
   } else if (secondsSinceLastAsyncData < 240) {
-    leds[4] = CRGB(255, 255, 0);
+    leds[2] = CRGB(255, 255, 0);
   } else {
-    leds[4] = CRGB(255, 0, 0);
+    leds[2] = CRGB(255, 0, 0);
   }
+  for (int i = 3; i < NUM_LEDS; i++) leds[i] = CRGB(0, 0, 0);
   showLeds();
 }
 
-TaskHandle_t ledShowTask = NULL;
-int ledShowDuration = 250;
+
 
 // Brightness follows a sine wave across the strip (sin8), so each LED's intensity
 // is a snapshot of a traveling wave rather than a flat color fill. As colorIndex
@@ -896,7 +1998,14 @@ void showDigitalStablesDetail() {
   display.setTextSize(1);
   display.setCursor(0, 10);
 
-  if (isSentByArraySet(digitalStablesData.sentbyarray, sizeof(digitalStablesData.sentbyarray))) {
+  // opMode bit0 = USB programming jumper fitted (Daffodil usbJumperFitted()): the CP2104 USB chip
+  // is powered and drains the battery in deep sleep, and the TPL5010 watchdog is disconnected.
+  // Shown inverted in place of the "Sent by" line so the page still fits the OLED.
+  if (digitalStablesData.opMode & 0x01) {
+    display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
+    display.println(" !! USB JUMPER ON !! ");
+    display.setTextColor(SSD1306_WHITE);
+  } else if (isSentByArraySet(digitalStablesData.sentbyarray, sizeof(digitalStablesData.sentbyarray))) {
     display.print("Sent by: ");
     char buffer[9];
     memcpy(buffer, digitalStablesData.sentbyarray, 8);
@@ -951,9 +2060,9 @@ void showCommaRecordPage() {
   display.print("/");
   display.println(commaRecord.total);
   display.print("rssi:");
-  display.print((int)LoRa.packetRssi());
+  display.print(lastRxRssi);
   display.print(" snr:");
-  display.println(LoRa.packetSnr());
+  display.println(lastRxSnr);
   display.display();
 }
 
@@ -1094,6 +2203,7 @@ void recordResetReason(RTCInfoRecord& now) {
   if (resetDiagMagic == RESET_DIAG_MAGIC) {
     previousUptimeSeconds = resetDiagUptimeSeconds;
     previousMinFreeHeap = resetDiagMinFreeHeap;
+    previousLoopStage = resetDiagLoopStage;
     previousUptimeKnown = true;
     resetDiagBootCount++;
   } else {
@@ -1103,12 +2213,14 @@ void recordResetReason(RTCInfoRecord& now) {
   resetDiagUptimeSeconds = 0;
   resetDiagMinFreeHeap = ESP.getMinFreeHeap();
 
-  char line[128];
-  snprintf(line, sizeof(line), "%04d-%02d-%02d %02d:%02d:%02d reason=%s boot=%lu prevUptime=%s prevMinHeap=%s",
+  char line[160];
+  snprintf(line, sizeof(line), "%04d-%02d-%02d %02d:%02d:%02d reason=%s boot=%lu prevUptime=%s prevMinHeap=%s stage=%s",
            now.year, now.month, now.date, now.hour, now.minute, now.second,
            resetReason.c_str(), (unsigned long)resetDiagBootCount,
            previousUptimeKnown ? String(previousUptimeSeconds).c_str() : "?",
-           previousUptimeKnown ? String(previousMinFreeHeap).c_str() : "?");
+           previousUptimeKnown ? String(previousMinFreeHeap).c_str() : "?",
+           previousUptimeKnown ? loopStageName(previousLoopStage) : "?");
+  resetDiagLoopStage = 0;
 
   // Keep only the newest lines so the log can't grow without bound
   String kept = "";
@@ -1341,8 +2453,131 @@ void syncRtcFromNtp() {
   }
 }
 
+
+void logClockChange(const RTCInfoRecord &before, const char *how) {
+  char line[96];
+  snprintf(line, sizeof(line), "clock %04d-%02d-%02d %02d:%02d:%02d -> %04d-%02d-%02d %02d:%02d:%02d (%s)",
+           before.year, before.month, before.date, before.hour, before.minute, before.second,
+           currentTimerRecord.year, currentTimerRecord.month, currentTimerRecord.date,
+           currentTimerRecord.hour, currentTimerRecord.minute, currentTimerRecord.second, how);
+  if (debug) Serial.println(line);
+  File log = LittleFS.open(RESET_LOG_FILE, "a");
+  if (log) {
+    log.println(line);
+    log.close();
+  }
+}
+
+// Runs a settings request queued by queueWebAction(). Called from loop()'s tick block.
+void processWebAction() {
+  uint8_t action;
+  char a[sizeof(webArgA)], b[sizeof(webArgB)];
+  portENTER_CRITICAL(&webMux);
+  action = webAction;
+  memcpy(a, webArgA, sizeof(a));
+  memcpy(b, webArgB, sizeof(b));
+  portEXIT_CRITICAL(&webMux);
+  if (action == WEB_NONE) return;
+
+  RTCInfoRecord before = currentTimerRecord;
+  if (action == WEB_SET_TIME) {
+    // "YYYY-MM-DDTHH:MM[:SS]" from the page's datetime-local input, Annabelle's local time.
+    struct tm t = {};
+    int sec = 0;
+    int got = sscanf(a, "%d-%d-%dT%d:%d:%d", &t.tm_year, &t.tm_mon, &t.tm_mday, &t.tm_hour, &t.tm_min, &sec);
+    if (got < 5 || t.tm_year < 2024 || t.tm_mon < 1 || t.tm_mon > 12 || t.tm_mday < 1 || t.tm_mday > 31) {
+      setWebResult(String("Not a valid time: ") + a);
+    } else {
+      t.tm_sec = sec;
+      t.tm_year -= 1900;
+      t.tm_mon -= 1;
+      t.tm_isdst = -1;
+      setenv("TZ", timezone.c_str(), 1);  // see syncRtcFromNtp()
+      tzset();
+      mktime(&t);  // fills in the weekday
+      writeRtc(t);
+      currentTimerRecord = timeManager.now();
+      logClockChange(before, "web, manual");
+      setWebResult("Clock set by hand");
+    }
+  } else if (action == WEB_SET_TIME_INTERNET) {
+    setenv("TZ", timezone.c_str(), 1);
+    tzset();
+    struct tm ntp;
+    if (!getLocalTime(&ntp, 0)) {
+      setWebResult("No internet time yet - SNTP has not synced");
+    } else {
+      writeRtc(ntp);
+      currentTimerRecord = timeManager.now();
+      logClockChange(before, ntp.tm_isdst > 0 ? "web, NTP AEDT" : "web, NTP AEST");
+      setWebResult("Clock set from internet time");
+    }
+  } else if (action == WEB_SEND_WEATHER) {
+    // Picked up by the weatherPending check further down this same tick, which does the download
+    // and the LoRa send - never from the async_tcp task (see loraDio0Fired).
+    weatherTrigger = "web";
+    weatherPending = true;
+  } else if (action == WEB_DEVICE_WIFI) {
+    // a = the device's serial as 16 hex digits, b = "on" or "off" (telepathons.js WiFi button)
+    uint8_t serial[8];
+    bool valid = strlen(a) == 16;
+    for (int i = 0; valid && i < 8; i++) {
+      char hex[3] = { a[i * 2], a[i * 2 + 1], 0 };
+      char *end;
+      serial[i] = (uint8_t)strtoul(hex, &end, 16);
+      valid = *end == 0;
+    }
+    bool on = strcmp(b, "on") == 0;
+    if (!valid || (!on && strcmp(b, "off") != 0)) {
+      setWebResult(String("Not a valid WiFi request: ") + a + " " + b);
+    } else {
+      portENTER_CRITICAL(&heardMux);
+      deviceCommandQueue.request(serial, on ? DEVICE_COMMAND_WIFI_ON : DEVICE_COMMAND_WIFI_OFF, 0, millis());
+      portEXIT_CRITICAL(&heardMux);
+      setWebResult(String("WiFi ") + b + " requested for " + a);
+    }
+  } else if (action == WEB_SET_GPS) {
+    double lat = atof(a), lon = atof(b);
+    if (lat < -90 || lat > 90 || lon < -180 || lon > 180 || (lat == 0 && lon == 0)) {
+      setWebResult(String("Not a valid position: ") + a + ", " + b);
+    } else {
+      Preferences prefs;
+      prefs.begin(CONFIG_PREFS, false);
+      prefs.putDouble("lat", lat);
+      prefs.putDouble("lon", lon);
+      prefs.end();
+      annabelleData.latitude = lat;
+      annabelleData.longitude = lon;
+      setWebResult("GPS saved - the weather forecast uses it after the next restart");
+    }
+  }
+  portENTER_CRITICAL(&webMux);
+  webAction = WEB_NONE;
+  portEXIT_CRITICAL(&webMux);
+}
+
+// Annabelle's DS18B20 (also its serial number) as the board temperature: a conversion is started at
+// second 15 and read at second 17, so loop() never waits the ~750 ms a blocking read takes.
+void tickBoardTemperature(uint8_t second) {
+  if (second == 15) {
+    tempSensor.setWaitForConversion(false);
+    tempSensor.requestTemperatures();
+  } else if (second == 17) {
+    float t = tempSensor.getTempCByIndex(0);
+    boardTemperature = (t <= -127) ? NAN : t;  // -127 = disconnected (the sketchbook DallasTemperature has no DEVICE_DISCONNECTED_C)
+  }
+}
+
 void setup() {
+  pinMode(WDT_DONE_PIN, OUTPUT);
+  digitalWrite(WDT_DONE_PIN, LOW);
+  xTaskCreatePinnedToCore(watchdogTask, "tplWatchdog", 2048, NULL, 2, &watchdogTaskHandle, 0);
+  pinMode(LED_POWER_PIN, OUTPUT);
+  digitalWrite(LED_POWER_PIN, HIGH);
   Serial.begin(115200);
+  // readString() returns after this much silence. The Pi writes each command in one go; the default
+  // 1000 ms made every Pi command cost loop() a full second (~10 a minute) - 2026-10-17.
+  Serial.setTimeout(100);
   Wire.begin();
 
   pinMode(SLEEP_SWITCH_26, OUTPUT);
@@ -1353,15 +2588,22 @@ void setup() {
     for (;;)
       ;
   }
+  // Start-up screen like Cleotilde's: the name large, then the firmware version and build time,
+  // held 2 s so they can be read before the boot screens replace them.
   display.clearDisplay();
-  display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0, 0);
-  display.println(F("Please Wait"));
+  display.setTextSize(2);
+  {
+    int16_t x1, y1;
+    uint16_t w, h;
+    display.getTextBounds("Annabelle", 0, 0, &x1, &y1, &w, &h);
+    display.setCursor((SCREEN_WIDTH - w) / 2, 10);
+    display.print("Annabelle");
+  }
+  centerText("Version " + String(firmwareVersion), 38);
+  centerText(FIRMWARE_BUILD_TIME, 50);
   display.display();
-
-  pinMode(SWITCH_PIN_LEFT, INPUT_PULLUP);
-  pinMode(SWITCH_PIN_RIGHT, INPUT_PULLUP);
+  delay(2000);
 
   if (!LittleFS.begin(true)) {
     if (debug) Serial.println("LittleFS Mount Failed, formatting...");
@@ -1385,6 +2627,17 @@ void setup() {
   double latitude = -37.13305556;
   double longitude = 144.47472222;
   double altitude = 410.0;
+  // A position saved from the web page (Settings > GPS) replaces the built-in one.
+  {
+    Preferences prefs;
+    if (prefs.begin(CONFIG_PREFS, true)) {
+      latitude = prefs.getDouble("lat", latitude);
+      longitude = prefs.getDouble("lon", longitude);
+      prefs.end();
+    }
+  }
+  annabelleData.latitude = latitude;
+  annabelleData.longitude = longitude;
   secret = "J5KFCNCPIRCTGT2UJUZFSMQK";
   String apiKey = "103df7bb3e4010e033d494f031b483e0";
 
@@ -1458,10 +2711,10 @@ void setup() {
     display.display();
   }
 
+  // strlcpy (2026-10-22): the old copy through a grp.length()-sized buffer had no room for the end
+  // marker, so an empty group identifier left stack garbage in the field and broke GetWebData's JSON.
   String grp = secretManager.getGroupIdentifier();
-  char gprid[grp.length()];
-  grp.toCharArray(gprid, grp.length());
-  strcpy(annabelleData.groupidentifier, gprid);
+  strlcpy(annabelleData.groupidentifier, grp.c_str(), sizeof(annabelleData.groupidentifier));
 
   String identifier = "AnnabelleV";
   char ty[identifier.length() + 1];
@@ -1472,8 +2725,15 @@ void setup() {
 
   delay(1000);
 
+  wifiManager.setTelepathonsProvider(fillTelepathonsJson);
+  wifiManager.setHistoryProvider(fillTelepathonHistoryJson);
+  wifiManager.setRadioHistoryProvider(fillRadioHistoryJson);
+  wifiManager.setWebDataExtras(addWebDataExtras);
+  wifiManager.setSettingsAction(queueWebAction);
+  wifiManager.pingVerbose = debug;  // its ping lines went to the Pi's serial line
   wifiManager.start();
   bool stationmode = wifiManager.getStationMode();
+  wifiStationWanted = stationmode && wifiManager.getSSID() != "";
   wifiManager.setSerialNumber(serialNumber);
   wifiManager.setLora(loraActive);
   String ssid = wifiManager.getSSID();
@@ -1496,9 +2756,11 @@ void setup() {
   if (debug) Serial.println(internetAvailable);
 
   if (loraActive) {
-    // Not LoRa.onReceive() - see loraDio0Fired.
+    // Not LoRa.onReceive() - see loraDio0Fired. Packets are read by loraRxTask - see rxSlots.
+    LoRa.receive();  // before the task starts - from here on only with loraMutex
+    loraMutex = xSemaphoreCreateMutex();
+    xTaskCreatePinnedToCore(loraRxTask, "loraRx", 4096, nullptr, 3, &loraRxTaskHandle, 1);
     attachInterrupt(digitalPinToInterrupt(LORA_DI0), onLoraDio0, RISING);
-    LoRa.receive();
   }
 
   pinMode(OP_MODE, INPUT_PULLUP);
@@ -1518,13 +2780,130 @@ void setup() {
   updateStatusLeds();  // show initial status at boot
 }
 
+// Pets the TPL5010 (see WDT_DONE_PIN). Started first thing in setup() so a slow boot isn't reset.
+void watchdogTask(void *arg) {
+  for (;;) {
+    uint32_t aliveMs = loopAliveMs;  // read before millis() so the difference can't wrap
+    uint32_t nowMs = millis();
+    bool alive = aliveMs ? nowMs - aliveMs < WDT_LOOP_STALL_MS : nowMs < WDT_SETUP_LIMIT_MS;
+    if (alive) {
+      digitalWrite(WDT_DONE_PIN, HIGH);
+      delayMicroseconds(100);
+      digitalWrite(WDT_DONE_PIN, LOW);
+    }
+    vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+}
+
+// WiFi watchdog (2026-10-17). After a router outage Annabelle stayed off the house WiFi until it
+// was reset by hand (memory down 44 KB, unreachable, LoRa still flowing to the Pi). Once a second:
+// while a station connection is wanted but missing, WiFi.reconnect() every minute; after
+// WIFI_RESTART_AFTER_SEC without WiFi - or that long in the AP fallback because the network wasn't
+// there at boot - restart, which joins the network the normal way. The data queue for the Pi is
+// in flash, so a restart loses only what is in RAM.
+#define WIFI_RESTART_AFTER_SEC (15UL * 60UL)
+void wifiWatchdogTick() {
+  static uint32_t downSec = 0;
+  if (!wifiStationWanted) return;
+  if (WiFi.status() == WL_CONNECTED) {
+    downSec = 0;
+    return;
+  }
+  downSec++;
+  if (downSec > radioStats.wifiDownSecMax) radioStats.wifiDownSecMax = downSec;
+  if (downSec % 60 == 30 && (WiFi.getMode() & WIFI_MODE_STA)) {
+    radioStats.wifiReconnects++;
+    WiFi.reconnect();  // returns at once; the connection happens in the background
+  }
+  if (downSec >= WIFI_RESTART_AFTER_SEC) {
+    LOOP_STAGE(STAGE_WIFI_RESTART);  // reported as the reset stage after the restart
+    if (debug) Serial.println("WiFi gone for 15 min - restarting");
+    delay(100);
+    ESP.restart();
+  }
+}
+
+// One RadioHistoryRow every RADIO_HISTORY_MS: the change in radioStats since the last one.
+void radioHistoryTick() {
+  static uint32_t lastMs = 0;
+  static RadioStats last = {};
+  uint32_t now = millis();
+  if (lastMs != 0 && now - lastMs < RADIO_HISTORY_MS) return;
+  if (lastMs == 0) {  // first call: just take the baseline
+    if (radioHistoryMagic != RADIO_HISTORY_MAGIC || radioHistoryHead >= RADIO_HISTORY_SLOTS || radioHistoryCount > RADIO_HISTORY_SLOTS) {
+      radioHistoryHead = 0;
+      radioHistoryCount = 0;
+      radioHistoryMagic = RADIO_HISTORY_MAGIC;
+    }
+    lastMs = now;
+    last = radioStats;
+    return;
+  }
+  lastMs = now;
+  RadioStats cur = radioStats;
+  RadioHistoryRow &h = radioHistory[radioHistoryHead];
+  h.epoch = heardNow();
+  h.heapFree16 = (uint16_t)min((uint32_t)65535, ESP.getFreeHeap() / 16);
+  h.heapBlock16 = (uint16_t)min((uint32_t)65535, (uint32_t)(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) / 16));
+  uint32_t rx = cur.rxPackets - last.rxPackets, np = cur.noPacket - last.noPacket;
+  h.rx = (uint16_t)min(rx, (uint32_t)65535);
+  h.noPacket = (uint16_t)min(np, (uint32_t)65535);
+  h.late = (uint16_t)min(cur.latencyOver1s - last.latencyOver1s, (uint32_t)65535);
+  h.latencyAvgMs = (uint16_t)min(rx + np ? (cur.latencyMsTotal - last.latencyMsTotal) / (rx + np) : 0, (uint32_t)65535);
+  h.loopMaxMs = (uint16_t)min(histLoopMaxMs, (uint32_t)65535);
+  h.lockWaitMaxMs = (uint16_t)min(histLockWaitMaxMs, (uint32_t)65535);
+  histLoopMaxMs = 0;
+  histLockWaitMaxMs = 0;
+  radioHistoryHead = (radioHistoryHead + 1) % RADIO_HISTORY_SLOTS;
+  if (radioHistoryCount < RADIO_HISTORY_SLOTS) radioHistoryCount++;
+  last = cur;
+}
+
+// /RadioHistory JSON, oldest first: rows of [epoch, heapFree, heapBlock, rx, corrupted, late,
+// latencyAvgMs, loopMaxMs, lockWaitMaxMs] - heap values in bytes.
+void fillRadioHistoryJson(JsonDocument &json) {
+  json["periodSec"] = RADIO_HISTORY_MS / 1000;
+  json["now"] = heardNow();
+  JsonArray rows = json["rows"].to<JsonArray>();
+  for (int i = radioHistoryCount; i >= 1; i--) {
+    const RadioHistoryRow &h = radioHistory[(radioHistoryHead + RADIO_HISTORY_SLOTS - i) % RADIO_HISTORY_SLOTS];
+    JsonArray r = rows.add<JsonArray>();
+    r.add(h.epoch);
+    r.add((uint32_t)h.heapFree16 * 16);
+    r.add((uint32_t)h.heapBlock16 * 16);
+    r.add(h.rx);
+    r.add(h.noPacket);
+    r.add(h.late);
+    r.add(h.latencyAvgMs);
+    r.add(h.loopMaxMs);
+    r.add(h.lockWaitMaxMs);
+  }
+}
+
 void loop() {
   int hour, minute, second;
+  loopAliveMs = millis();
+  {
+    static uint32_t lastLoopMs = 0;
+    uint32_t nowMs = millis();
+    if (lastLoopMs != 0) {
+      uint32_t loopMs = nowMs - lastLoopMs;
+      if (loopMs > radioStats.loopMsMax) radioStats.loopMsMax = loopMs;
+      if (loopMs > histLoopMaxMs) histLoopMaxMs = loopMs;
+      if (loopMs > 1000) radioStats.loopOver1s++;
+    }
+    lastLoopMs = nowMs;
+  }
+  radioHistoryTick();
+  LOOP_STAGE(STAGE_TOP);
+  if (!fragBootBlock) fragBootBlock = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
 
   if (clockTicked) {
     portENTER_CRITICAL(&mux);
     clockTicked = false;
     portEXIT_CRITICAL(&mux);
+    LOOP_STAGE(STAGE_CLOCK);
+    wifiWatchdogTick();
 
     currentTimerRecord = timeManager.now();
     timeIsSet = true;
@@ -1543,7 +2922,12 @@ void loop() {
     if (second == 30 && (!rtcCheckedSinceBoot || minute == 7)) {
       syncRtcFromNtp();
     }
-    if (weatherScreenShown && !switchPositionLeft) {  // live clock on the weather page
+    fragBegin(STAGE_WEB_ACTION);
+    processWebAction();
+    fragEnd(STAGE_WEB_ACTION);
+    LOOP_STAGE(STAGE_CLOCK);
+    tickBoardTemperature(second);
+    if (weatherScreenShown) {  // live clock on the weather page
       display.fillRect(0, 0, SCREEN_WIDTH, 8, SSD1306_BLACK);
       drawWeatherTitle();
       display.display();
@@ -1552,131 +2936,82 @@ void loop() {
     // Set pending flag at trigger time; actual work deferred until serial is free
     if (minute % 5 == 0 && second == 0) {
       weatherPending = true;
+      weatherTrigger = "timer";
     }
 
     if (weatherPending && Serial.available() == 0 && !inSerial) {
       weatherPending = false;
-      if (debug) Serial.println("About to get and send weatherforecasts");
-      bool wifiAvail = wifiManager.getInternetAvailable();
-      if (!wifiAvail) {
-        // getInternetAvailable() only reflects the last ping; without an active
-        // recheck here, one failed ping (e.g. at boot, before DHCP/DNS settled)
-        // latches false forever and this 5-minute trigger never downloads again.
-        // Mirrors Daffodil.ino's recheck-on-reconnect handling.
-        wifiManager.checkInternetConnectionAvailable();
-        wifiAvail = wifiManager.getInternetAvailable();
-      }
-      if (wifiAvail) {
-        weatherDownloading = true;
-        bool success = weatherForecastManager->downloadWeatherData();
-        weatherDownloading = false;
-        updateStatusLeds();
-        if (debug) Serial.println(success ? "Weather forecast downloaded" : "Weather forecast download failed");
-      } else {
-        if (debug) Serial.println("No internet, skipping weather forecast download");
-      }
-      WeatherForecast* forecasts = weatherForecastManager->getForecasts();
-      if (forecasts != nullptr) {
-        WeatherForecastUpdate weatherForecastUpdate;
-        for (int i = 0; i < 4; i++) {
-          weatherForecastUpdate.forecasts[i] = forecasts[i];
-        }
-        weatherForecastUpdate.totpcode = secretManager.generateCode();
-        if (debug) Serial.print("sending weather via LoRa, size=");
-        if (debug) Serial.println(sizeof(WeatherForecastUpdate));
-        sendMessage(weatherForecastUpdate);  // ends in RX mode; loop polls for packets
-        if (!switchPositionLeft) showWeatherForecast();
-      } else {
-        if (debug) Serial.println("No forecast data available to send");
-      }
-    }
-
-    int left = digitalRead(SWITCH_PIN_LEFT);
-    int right = digitalRead(SWITCH_PIN_RIGHT);
-    bool previousSwitchPositionLeft = switchPositionLeft;
-    if (left == LOW && right == HIGH) {
-      switchPositionLeft = true;
-    } else if (left == HIGH && right == LOW) {
-      switchPositionLeft = false;
-    }
-    if (switchPositionLeft != previousSwitchPositionLeft) {
-      if (switchPositionLeft) {
-        showLastReceivedData();
-      } else {
-        showWeatherForecast();
-      }
+      fragBegin(STAGE_WEATHER_DOWNLOAD);
+      sendWeatherForecast(1, weatherTrigger);
+      fragEnd(STAGE_WEATHER_DOWNLOAD);
     }
 
     updateStatusLeds();  // refresh status LEDs every second
   }
 
-  if (loraDio0Fired) {
-    loraDio0Fired = false;
-    // Reads and clears the IRQ flags and points the FIFO at the packet; leaves the radio in standby
-    // after a packet, or switches it to single RX when there was none (CRC error, TX done).
-    int packetSize = LoRa.parsePacket();
-    if (packetSize > 0) {
-      loraPacketSize = packetSize;
-      loraReceived = true;
-    } else {
-      LoRa_rxMode();  // back to continuous receive
-    }
+  if (!loraReceived && rxTail != rxHead) {
+    rxCurrent = &rxSlots[rxTail];
+    rxCurrentPos = 0;
+    loraPacketSize = rxCurrent->len;
+    loraReceived = true;
   }
 
   if (loraReceived) {
     if (debug) Serial.printf("lora recive loraPacketSize: %d \n", loraPacketSize);
     if (debug) Serial.println("");
+    fragBegin(STAGE_LORA);
     processLora(loraPacketSize);
-    LoRa_rxMode();  // parsePacket() left the radio in standby
+    fragEnd(STAGE_LORA);
+    lastRxRssi = rxPacketRssi();
+    lastRxSnr = rxPacketSnr();
+    rxCurrent = nullptr;
+    rxTail = (rxTail + 1) % RX_SLOTS;  // slot free for loraRxTask again
     loraReceived = false;
     // A VitalSigns (and sometimes a DeviceIdentity) packet follows a data pulse - keep showing
     // that device's data page instead of switching to "Unidentified".
-    if (loraPacketSize != sizeof(VitalSignsRecord) && loraPacketSize != sizeof(DeviceIdentityRecord)) lastReceivedPacketSize = loraPacketSize;
-    loraActivitySeconds = 3;
+    if (loraPacketSize != sizeof(VitalSignsRecord) && loraPacketSize != sizeof(DeviceIdentityRecord) &&
+        loraPacketSize != sizeof(VitalSignsRecordV2) && loraPacketSize != sizeof(VitalSignsRecordV3) &&
+        loraPacketSize != sizeof(PowerProfileRecord)) lastReceivedPacketSize = loraPacketSize;
 
     currentPalette = loraReceivePalette;
     currentBlending = LINEARBLEND;
     ledShowDuration = 2000;
     runLedShow = true;
 
-    if (switchPositionLeft) {
-      showLastReceivedData();
-    }
+    showLastReceivedData();
   }
   loraPacketSize = 0;
 
+  // Device commands first: a sleeping Daffodil listens for both in the same window after its
+  // VitalSigns, and stops listening once the forecast it was waiting for arrives.
+  {
+    DeviceCommandRecord command;
+    portENTER_CRITICAL(&heardMux);
+    bool haveCommand = deviceCommandQueue.takeDue(millis(), command);
+    portEXIT_CRITICAL(&heardMux);
+    if (haveCommand) {
+      fragBegin(STAGE_COMMAND_TX);
+      int result = sendMessage(command);
+      fragEnd(STAGE_COMMAND_TX);
+      if (debug) Serial.printf("device command %u sent, lora=%d\n", command.command, result);
+    }
+  }
+
+  if (weatherReplyPending && (long)(millis() - weatherReplyDueMs) >= 0) {
+    weatherReplyPending = false;
+    fragBegin(STAGE_WEATHER_REPLY);
+    sendWeatherReply();
+    fragEnd(STAGE_WEATHER_REPLY);
+  }
+
   if (Serial.available() != 0) {
+    fragBegin(STAGE_SERIAL);
     inSerial = true;
     String command = Serial.readString();
+    if (command.startsWith("AsyncData") && !command.startsWith("AsyncDataCount")) LOOP_STAGE(STAGE_ASYNCDATA);
 
     if (command.startsWith("getWF")) {
-      if (debug) Serial.println("About to get and send weatherforecasts");
-      bool wifiAvail = wifiManager.getInternetAvailable();
-      if (!wifiAvail) {
-        for (int i = 0; i < 3 && !wifiAvail; i++) {
-          wifiManager.checkInternetConnectionAvailable();
-          wifiAvail = wifiManager.getInternetAvailable();
-        }
-      }
-      if (wifiAvail) {
-        bool success = weatherForecastManager->downloadWeatherData();
-        if (debug) Serial.println(success ? "Weather forecast downloaded" : "Weather forecast download failed");
-      } else {
-        if (debug) Serial.println("No internet after retries, skipping weather forecast download");
-      }
-      WeatherForecast* forecasts = weatherForecastManager->getForecasts();
-      if (forecasts != nullptr) {
-        WeatherForecastUpdate weatherForecastUpdate;
-        for (int i = 0; i < 4; i++) {
-          weatherForecastUpdate.forecasts[i] = forecasts[i];
-        }
-        weatherForecastUpdate.totpcode = secretManager.generateCode();
-        sendMessage(weatherForecastUpdate);
-        if (!switchPositionLeft) showWeatherForecast();
-        if (debug) Serial.println("Weather send complete");
-      } else {
-        if (debug) Serial.println("No forecast data available to send");
-      }
+      sendWeatherForecast(3, "Pi");
     } else if (command == USER_COMMAND) {
       Serial.println(F("Ok-"));
     } else if (command == LIFE_CYCLE_EVENT_START_AWAKE) {
@@ -1791,6 +3126,9 @@ void loop() {
         Serial.println(code);
       }
       Serial.flush();
+    } else if (command.startsWith("GetFirmware")) {
+      Serial.println("Version " + String(firmwareVersion) + " " FIRMWARE_BUILD_TIME);
+      Serial.println(F("Ok-GetFirmware"));
     } else if (command.startsWith("GetSerialNumber")) {
       Serial.println(serialNumber);
       Serial.println("Ok-GetSerialNumber");
@@ -1856,7 +3194,7 @@ void loop() {
       // Must be checked before "AsyncData" below (startsWith would match both).
       // Non-destructive peek so the Pi knows how many lines to read before it
       // actually asks for the data with AsyncData.
-      Serial.println(dataManager.getPendingQueueItemCount() + vitalSignsStore.pendingCount() + deviceIdentityStore.pendingCount());
+      Serial.println(dataManager.getPendingQueueItemCount() + vitalSignsStore.pendingCount() + deviceIdentityStore.pendingCount() + powerProfileStore.pendingCount());
       //
       // Per-type available/dropped/flash-health breakdown, added 2026-08-04
       // for capacity planning as device counts grow (many Daffodils, several
@@ -1896,6 +3234,8 @@ void loop() {
       Serial.print("|Vital="); Serial.print(vitalSignsStore.pendingCount());
       Serial.print(",0,-1");
       Serial.print("|Identity="); Serial.print(deviceIdentityStore.pendingCount());
+      Serial.print(",0,-1");
+      Serial.print("|Power="); Serial.print(powerProfileStore.pendingCount());
       Serial.println(",0,-1");
       Serial.println("Ok-AsyncDataCount");
       Serial.flush();
@@ -1973,6 +3313,7 @@ void loop() {
       // Counted in AsyncDataCount's total above, so AnnabelleReader's line bound includes them
       int vitalDownloaded = vitalSignsStore.pushPendingToSerial(Serial);
       int identityDownloaded = deviceIdentityStore.pushPendingToSerial(Serial);
+      int powerDownloaded = powerProfileStore.pushPendingToSerial(Serial);
 
       Serial.print("Ok-AsyncData#");
       Serial.print("DS="); Serial.print(dsDownloaded);
@@ -1983,6 +3324,7 @@ void loop() {
       Serial.print("|Langley="); Serial.print(langleyDownloaded);
       Serial.print("|Vital="); Serial.print(vitalDownloaded);
       Serial.print("|Identity="); Serial.print(identityDownloaded);
+      Serial.print("|Power="); Serial.print(powerDownloaded);
       //
       // Reset diagnostics ride on the AsyncData terminator so the Hypothalamus
       // records them every Async Cycle (generic to any microcontroller):
@@ -2019,7 +3361,10 @@ void loop() {
       Serial.println("Failure-Command Not Found-" + command);
       Serial.flush();
     }
+    loraLock();
     LoRa_rxMode();
+    loraUnlock();
     inSerial = false;
+    fragEnd(resetDiagLoopStage == STAGE_ASYNCDATA ? STAGE_ASYNCDATA : STAGE_SERIAL);
   }
 }

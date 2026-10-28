@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html data-bs-theme="light" lang="en">
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, shrink-to-fit=no">
+    <title>Annabelle</title>
+    <link rel="stylesheet" href="assets/bootstrap/css/bootstrap.min.css">
+    <style>
+        body { background: #f4f5f7; }
+        .hdr-btn { border: 0; background: none; padding: 4px 6px; color: #0d6efd; }
+        .hdr-btn svg { width: 24px; height: 24px; }
+        .chip { font-size: 12px; font-weight: bold; margin-right: 8px; }
+        .panel { background: #fff; border-radius: 8px; padding: 14px; margin-bottom: 14px; box-shadow: 0 1px 3px rgba(0,0,0,.15); }
+        .panel h5 { margin-bottom: 10px; }
+        .kv { display: flex; justify-content: space-between; font-size: 14px; padding: 2px 0; }
+        .kv span:first-child { color: #6c757d; }
+        .result { font-size: 13px; margin-top: 8px; color: #0d6efd; min-height: 18px; }
+        .drift { background: #fff3cd; border-radius: 4px; padding: 4px 8px; font-size: 13px; margin-top: 4px; }
+
+        /* Hypercard stacks: the front card is the newest packet, the edges behind it show how many
+           older ones there are. */
+        .stack { position: relative; margin: 0 10px 22px 0; }
+        .stack.d1 .hc { box-shadow: 4px 4px 0 #d5d9de; }
+        .stack.d2 .hc { box-shadow: 4px 4px 0 #d5d9de, 8px 8px 0 #e3e6ea; }
+        .stack.d3 .hc { box-shadow: 4px 4px 0 #d5d9de, 8px 8px 0 #e3e6ea, 12px 12px 0 #eceef1; }
+        .hc { background: #fff; border: 1px solid #ccd1d7; border-radius: 8px; padding: 10px 12px; touch-action: pan-y; }
+        .hc.older { background: #fbfaf3; }
+        .hc-top { display: flex; justify-content: space-between; align-items: center; }
+        .hc-name { font-size: 18px; font-weight: bold; word-break: break-all; }
+        .hc-age { font-weight: bold; font-size: 14px; }
+        .hc-logo { height: 40px; width: auto; }
+        .hc-row { display: flex; justify-content: space-between; font-size: 14px; padding: 1px 0; }
+        .hc-row span:first-child { color: #6c757d; }
+        .hc-nav { display: flex; justify-content: space-between; align-items: center; margin-top: 8px; border-top: 1px solid #eee; padding-top: 6px; }
+        .hc-nav button { min-width: 44px; }
+        .hc-tabs { display: flex; gap: 4px; margin: 6px 0 4px 0; border-bottom: 1px solid #dee2e6; }
+        .hc-tabs button { flex: 1; border: 0; background: none; font-size: 14px; padding: 8px 0 6px 0; color: #6c757d; border-bottom: 3px solid transparent; }
+        .hc-tabs button.active { color: #0d6efd; font-weight: bold; border-bottom-color: #0d6efd; }
+        .hc-body { min-height: 160px; }
+        .hc-sub { font-size: 12px; color: #6c757d; margin-top: 4px; }
+        .hc-empty { font-size: 13px; color: #6c757d; padding: 8px 0; }
+        .hc-foot { font-size: 12px; color: #6c757d; margin-top: 4px; }
+        .tp-warn { background: #c62828; color: #fff; font-weight: bold; border-radius: 4px; padding: 2px 6px; font-size: 13px; margin: 4px 0; }
+        .bad { color: #c62828; font-weight: bold; }
+        #weather-link { cursor: pointer; text-decoration: underline; color: #2e7d32; }
+
+        /* Diagnostics tab */
+        .diag-note { font-size: 12px; color: #6c757d; margin-top: 6px; }
+        .diag-table { width: 100%; font-size: 14px; }
+        .diag-table th { color: #6c757d; font-weight: normal; text-align: left; padding: 2px 6px 2px 0; }
+        .diag-table td { padding: 2px 6px 2px 0; }
+        .diag-table td.num, .diag-table th.num { text-align: right; }
+        .ok { color: #2e7d32; }
+
+        /* The junk pile: every source that never sent a packet that checked out. */
+        .pile-head { cursor: pointer; user-select: none; }
+        .pile-deck { position: relative; height: 34px; margin: 8px 0 4px 0; }
+        .pile-deck div { position: absolute; width: 70%; height: 26px; border: 1px solid #c9b8b8; border-radius: 6px; background: #f6eded; }
+        .junk .hc { background: #fdf6f6; border-color: #e3c7c7; }
+        .junk .hc-name { font-size: 15px; }
+    </style>
+</head>
+
+<body style="margin:auto">
+    <div class="container container-fluid" style="margin-top:16px;max-width:1200px">
+        <div class="d-flex align-items-center">
+            <img src="assets/img/Annabelle.svg" style="width:70px;margin-right:12px">
+            <div style="flex:1">
+                <h5 id="host-name" style="font-size:24px;margin:0;cursor:pointer" title="Show raw data">Annabelle</h5>
+                <div id="clock" style="font-size:15px;color:#555"></div>
+                <div><span id="chip-lora" class="chip">LoRa</span><span id="chip-net" class="chip">Internet</span><span id="chip-ssid" class="chip" style="color:#555"></span></div>
+                <div style="font-size:13px;margin-top:2px"><span id="weather-line"></span>
+                    <button id="weather-send" class="btn btn-outline-primary btn-sm" type="button" style="padding:0 6px;font-size:12px;margin-left:6px">Send Now</button></div>
+            </div>
+            <button id="wifi-btn" class="hdr-btn" title="WiFi"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M2 8.5a15 15 0 0 1 20 0"/><path d="M5 12a10 10 0 0 1 14 0"/><path d="M8.5 15.5a5 5 0 0 1 7 0"/><circle cx="12" cy="19" r="1" fill="currentColor"/></svg></button>
+            <button id="settings-btn" class="hdr-btn" title="Settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg></button>
+        </div>
+        <div id="drift" class="drift d-none"></div>
+        <!-- The 4 forecast entries in the last WeatherForecastUpdate broadcast -->
+        <div id="weather-panel" class="panel d-none" style="margin-top:10px"></div>
+        <hr>
+
+        <!-- Settings: the Daffodil page's System Info panel, without the sensor/switch parts -->
+        <div id="settings-panel" class="panel d-none">
+            <h5>System Info</h5>
+            <div class="kv"><span>Serial #</span><span id="serial-number"></span></div>
+            <div class="kv"><span>Firmware</span><span id="firmware"></span></div>
+            <div class="kv"><span>Board temperature</span><span id="board-temp"></span></div>
+            <div class="kv"><span>IP address</span><span id="ip-address"></span></div>
+            <div class="kv"><span>Internet ping time</span><span id="ping-time"></span></div>
+            <div class="kv"><span>Internet time (NTP)</span><span id="ntp-status"></span></div>
+            <div class="kv"><span>Up</span><span id="uptime"></span></div>
+            <hr>
+            <h5>Set Time</h5>
+            <div class="d-flex flex-wrap align-items-center" style="gap:8px">
+                <input id="date-input" class="form-control" type="datetime-local" step="1" style="max-width:240px">
+                <button class="btn btn-primary btn-sm" id="manual-time-submit" type="button">Set manually</button>
+                <button class="btn btn-primary btn-sm" id="internet-time-button" type="button">From internet</button>
+            </div>
+            <div style="font-size:12px;color:#6c757d;margin-top:4px">Annabelle's local time. The box starts at your phone's time.</div>
+            <hr>
+            <h5>GPS</h5>
+            <div class="input-group"><span class="input-group-text">Latitude</span><input class="form-control" type="text" inputmode="decimal" id="latitude"></div>
+            <div class="input-group" style="margin-top:10px;margin-bottom:10px"><span class="input-group-text">Longitude</span><input class="form-control" type="text" inputmode="decimal" id="longitude"></div>
+            <button class="btn btn-success btn-sm" id="save-gps-button" type="button">Save GPS</button>
+            <div id="settings-result" class="result"></div>
+            <div style="margin-top:10px"><button class="btn btn-secondary btn-sm" id="settings-close" type="button">Close</button></div>
+        </div>
+
+        <!-- WiFi: the Daffodil page's WiFi Config panel -->
+        <div id="wifi-panel" class="panel d-none">
+            <h5>WiFi Config</h5>
+            <div class="form-check form-switch" style="margin-bottom:12px">
+                <input class="form-check-input" type="checkbox" id="wifi-switch">
+                <label class="form-check-label" for="wifi-switch" id="wifi-switch-label">Join a WiFi network</label>
+            </div>
+            <div class="station-mode">
+                <div class="input-group"><span class="input-group-text">SSID</span><select class="form-select" id="ssid"></select></div>
+                <div class="input-group" style="margin-top:12px"><span class="input-group-text">Password</span><input class="form-control" type="password" id="wifi-password"></div>
+                <div class="input-group" style="margin-top:12px"><span class="input-group-text">Host Name</span><input class="form-control" type="text" id="hostname"></div>
+            </div>
+            <div class="ap-mode">
+                <div class="input-group"><span class="input-group-text">AP SSID</span><input class="form-control" type="text" id="ap-address"></div>
+                <div class="input-group" style="margin-top:12px"><span class="input-group-text">Password</span><input class="form-control" type="password" id="ap-password"></div>
+                <div class="input-group" style="margin-top:12px"><span class="input-group-text">Host Name</span><input class="form-control" type="text" id="ap-hostname"></div>
+            </div>
+            <div style="font-size:12px;color:#6c757d;margin-top:8px">Saving restarts Annabelle. If it can't join the network it comes back as its own access point.</div>
+            <div id="wifi-result" class="result"></div>
+            <div style="margin-top:6px"><button class="btn btn-danger btn-sm" id="wifi-cancel" type="button" style="margin-right:12px">Cancel</button><button class="btn btn-success btn-sm" id="wifi-submit" type="button">Save</button></div>
+        </div>
+
+        <!-- Raw GetWebData, like tapping the name on the Daffodil page -->
+        <div id="raw-panel" class="panel d-none">
+            <h5>Raw data <button class="btn btn-secondary btn-sm float-end" id="raw-close" type="button">Close</button></h5>
+            <div id="raw-table" style="font-size:13px;word-break:break-all"></div>
+        </div>
+
+        <ul class="nav nav-pills" style="margin-bottom:10px">
+            <li class="nav-item"><button class="nav-link active" id="tab-btn-devices" type="button">Devices</button></li>
+            <li class="nav-item"><button class="nav-link" id="tab-btn-diag" type="button">Diagnostics</button></li>
+        </ul>
+        <div class="d-flex justify-content-between align-items-center" style="margin-bottom:8px">
+            <div id="summary" style="font-size:13px;color:#666"></div>
+            <div id="status" class="text-danger" style="font-size:13px"></div>
+        </div>
+        <div id="tab-devices">
+            <div id="telepathons" class="row"></div>
+            <div id="junk"></div>
+        </div>
+        <!-- Filled by telepathons.js renderDiagnostics() from the same /Telepathons poll -->
+        <div id="tab-diag" class="d-none">
+            <div class="row">
+                <div class="col-12 col-lg-6"><div class="panel" id="diag-radio"></div></div>
+                <div class="col-12 col-lg-6"><div class="panel" id="diag-corrupt"></div></div>
+                <div class="col-12"><div class="panel" id="diag-devices"></div></div>
+                <div class="col-12"><div class="panel" id="diag-history"></div></div>
+            </div>
+        </div>
+    </div>
+    <script src="assets/js/telepathons.js"></script>
+    <script src="assets/js/settings.js"></script>
+</body>
+
+</html>
