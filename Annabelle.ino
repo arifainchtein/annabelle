@@ -1,4 +1,5 @@
 #include <LittleFS.h>
+#include <DeviceSerial.h>  // the serial number is the efuse MAC (2026-10-30)
 #include "esp_heap_caps.h"
 #include "Arduino.h"
 #include <LoRa.h>
@@ -271,6 +272,7 @@ RadioStats radioStats = {};
 extern String resetReason;
 extern bool previousUptimeKnown;
 extern uint8_t previousLoopStage;
+extern uint32_t resetDiagLowMemRestarts;
 const char *loopStageName(uint8_t s);
 // Fragmentation tracker data - see fragBegin()/fragEnd() further down
 #define FRAG_STAGES 13
@@ -806,6 +808,7 @@ void fillTelepathonsJson(JsonDocument &json) {
   radio["wifiDownSecMax"] = radioStats.wifiDownSecMax;
   radio["resetReason"] = resetReason;
   radio["resetStage"] = previousUptimeKnown ? loopStageName(previousLoopStage) : "";
+  radio["lowMemRestarts"] = resetDiagLowMemRestarts;
   // Fragmentation by step: [name, total change of the largest free block in bytes, runs]
   radio["fragBootBlock"] = fragBootBlock;
   JsonArray frag = radio["frag"].to<JsonArray>();
@@ -1017,14 +1020,18 @@ RTC_NOINIT_ATTR uint32_t resetDiagMinFreeHeap;  // ESP.getMinFreeHeap() as of th
 // Where loop() was when the board reset (2026-10-17: an unexplained WDT reset at 06:54 after a
 // night of router trouble). Set with LOOP_STAGE() at each big step; read back after the reset.
 RTC_NOINIT_ATTR uint8_t resetDiagLoopStage;
+// Planned low-memory restarts since the last power-on (lowMemoryWatchdogTick(), 2026-10-29)
+RTC_NOINIT_ATTR uint32_t resetDiagLowMemRestarts;
 enum LoopStage : uint8_t {
   STAGE_TOP = 1, STAGE_CLOCK, STAGE_WEB_ACTION, STAGE_WEATHER_DOWNLOAD, STAGE_WEATHER_TX, STAGE_DISPLAY,
-  STAGE_LORA, STAGE_COMMAND_TX, STAGE_WEATHER_REPLY, STAGE_SERIAL, STAGE_WIFI_RESTART, STAGE_ASYNCDATA
+  STAGE_LORA, STAGE_COMMAND_TX, STAGE_WEATHER_REPLY, STAGE_SERIAL, STAGE_WIFI_RESTART, STAGE_ASYNCDATA,
+  STAGE_LOWMEM_RESTART
 };
 const char *loopStageName(uint8_t s) {
   static const char *names[] = { "unknown", "loop top", "1 s clock work", "web settings action", "weather download",
                                  "weather broadcast", "display", "LoRa packet", "device command send", "weather reply",
-                                 "Pi serial command", "restart: WiFi lost", "Pi data download (AsyncData)" };
+                                 "Pi serial command", "restart: WiFi lost", "Pi data download (AsyncData)",
+                                 "restart: low memory" };
   return s < sizeof(names) / sizeof(names[0]) ? names[s] : "unknown";
 }
 #define LOOP_STAGE(s) (resetDiagLoopStage = (s))
@@ -2209,6 +2216,7 @@ void recordResetReason(RTCInfoRecord& now) {
   } else {
     resetDiagMagic = RESET_DIAG_MAGIC;
     resetDiagBootCount = 1;
+    resetDiagLowMemRestarts = 0;
   }
   resetDiagUptimeSeconds = 0;
   resetDiagMinFreeHeap = ESP.getMinFreeHeap();
@@ -2649,10 +2657,9 @@ void setup() {
   tempSensor.begin();
   uint8_t address[8];
   if (tempSensor.getAddress(address, 0)) {
-    for (uint8_t i = 0; i < 8; i++) {
-      serialNumber += String(address[i], HEX);
-    }
-    memcpy(annabelleData.serialnumberarray, address, sizeof(address));
+    // 2026-10-30: the serial number is the efuse MAC, as the factory records it, not this sensor's ID
+    DeviceSerial::fill(annabelleData.serialnumberarray);
+    serialNumber = DeviceSerial::toString(annabelleData.serialnumberarray);
   } else {
     if (debug) Serial.println(F("Error fetching the temp sensor address"));
   }
@@ -2823,6 +2830,27 @@ void wifiWatchdogTick() {
   }
 }
 
+// Low-memory watchdog (2026-10-29). On 10-23 and twice on 10-28 Annabelle panicked out of memory
+// (LittleFS.exists() in loop(), then the async_tcp accept). Once a second: when the largest free
+// block has stayed under WEB_MIN_FREE_BLOCK (the web gate's limit) for LOWMEM_RESTART_AFTER_SEC,
+// restart before it crashes. Reported as reason SW, stage "restart: low memory", and counted in
+// resetDiagLowMemRestarts (lowMemRestarts on /Telepathons).
+#define LOWMEM_RESTART_AFTER_SEC (10UL * 60UL)
+void lowMemoryWatchdogTick() {
+  static uint32_t lowSec = 0;
+  if (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) >= WEB_MIN_FREE_BLOCK) {
+    lowSec = 0;
+    return;
+  }
+  if (++lowSec >= LOWMEM_RESTART_AFTER_SEC) {
+    LOOP_STAGE(STAGE_LOWMEM_RESTART);  // reported as the reset stage after the restart
+    resetDiagLowMemRestarts++;
+    if (debug) Serial.println("Low memory for 10 min - restarting");
+    delay(100);
+    ESP.restart();
+  }
+}
+
 // One RadioHistoryRow every RADIO_HISTORY_MS: the change in radioStats since the last one.
 void radioHistoryTick() {
   static uint32_t lastMs = 0;
@@ -2904,6 +2932,7 @@ void loop() {
     portEXIT_CRITICAL(&mux);
     LOOP_STAGE(STAGE_CLOCK);
     wifiWatchdogTick();
+    lowMemoryWatchdogTick();
 
     currentTimerRecord = timeManager.now();
     timeIsSet = true;

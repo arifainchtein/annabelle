@@ -377,7 +377,9 @@ function renderDiagnostics() {
                 "Why Annabelle last restarted, and what its main loop was doing at that moment")
             + drow("WiFi", (r.wifiReconnects ? flag(r.wifiReconnects + " reconnects", true) : "no drops")
                 + (r.wifiDownSecMax ? ", longest gap " + fmtDuration(r.wifiDownSecMax) : ""),
-                "Annabelle retries the house WiFi every minute while it is gone, and restarts after 15 minutes without it") : "")
+                "Annabelle retries the house WiFi every minute while it is gone, and restarts after 15 minutes without it")
+            + (r.lowMemRestarts !== undefined ? drow("Low-memory restarts", r.lowMemRestarts ? flag(r.lowMemRestarts + " since power-on", true) : "none",
+                "Annabelle restarts when the largest free block stays under 6 KB for 10 minutes, rather than wait to crash") : "") : "")
         + (r.heapFree !== undefined ? "<hr style=\"margin:8px 0\">"
             + drow("Free memory", Math.round(r.heapFree / 1024) + " KB (lowest " + Math.round(r.heapMin / 1024) + " KB)")
             + drow("Largest free block", flag(Math.round(r.heapBlock / 1024) + " KB", r.heapBlock < 12288),
