@@ -42,7 +42,7 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 
 // Shown on the OLED at start-up, answered to the Pi's GetFirmware and in GetWebData (like Cleotilde).
 // Add 1 to firmwareVersion with every flashed change; the build time tells two builds of one version apart.
-const int firmwareVersion = 5;
+const int firmwareVersion = 6;
 #define FIRMWARE_BUILD_TIME __DATE__ " " __TIME__
 
 // Display settings for 2.4" SSD1309 — same OLED hardware as Paula
