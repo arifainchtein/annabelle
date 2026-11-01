@@ -42,7 +42,7 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 
 // Shown on the OLED at start-up, answered to the Pi's GetFirmware and in GetWebData (like Cleotilde).
 // Add 1 to firmwareVersion with every flashed change; the build time tells two builds of one version apart.
-const int firmwareVersion = 6;
+const int firmwareVersion = 10;
 #define FIRMWARE_BUILD_TIME __DATE__ " " __TIME__
 
 // Display settings for 2.4" SSD1309 — same OLED hardware as Paula
@@ -274,6 +274,24 @@ extern bool previousUptimeKnown;
 extern uint8_t previousLoopStage;
 extern uint32_t resetDiagLowMemRestarts;
 const char *loopStageName(uint8_t s);
+// Failed memory requests (2026-10-31: v6 aborted in AsyncTCP tcp_accept when new AsyncClient
+// failed, although the heap never fell below ~34 KB free - fragmentation or a corrupted heap?).
+// heap_caps calls allocFailed() on every failed malloc/new, before the caller handles it or
+// aborts; the last one is kept in RTC memory so the boot after a panic can report it.
+struct AllocFailRecord {
+  uint32_t count;          // failed requests this boot
+  uint32_t size;           // bytes the last one asked for
+  uint32_t caps;           // MALLOC_CAP_* flags it asked for
+  uint32_t freeBytes;      // free 8-bit heap right after it failed
+  uint32_t largestBlock;   // largest free 8-bit block right after it failed
+  uint32_t uptimeSeconds;  // when it failed
+  char task[16];           // task that asked
+};
+extern AllocFailRecord allocFail;
+extern AllocFailRecord previousAllocFail;
+// Declared here so the Arduino builder doesn't put its own prototypes above the struct
+void allocFailed(size_t size, uint32_t caps, const char *functionName);
+void formatAllocFail(const AllocFailRecord &r, char *buf, size_t n);
 // Fragmentation tracker data - see fragBegin()/fragEnd() further down
 #define FRAG_STAGES 13
 struct FragStat {
@@ -822,7 +840,27 @@ void fillTelepathonsJson(JsonDocument &json) {
   // Memory (2026-10-16): the /Telepathons reply gets cut off when no free block is big enough.
   radio["heapFree"] = ESP.getFreeHeap();
   radio["heapMin"] = ESP.getMinFreeHeap();
+  // heapFree/heapMin count all internal RAM, including ~30 KB of IRAM that malloc/new can't use
+  // (32-bit access only). heapFree8/heapMin8 are the 8-bit heap that ordinary allocations come from.
+  radio["heapFree8"] = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_8BIT);
+  radio["heapMin8"] = (uint32_t)heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
   radio["heapBlock"] = (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+  // Failed memory requests (allocFailed()): [count, last size, caps, free, largest block, task, uptime s]
+  // for this boot and for the boot before the last reset
+  const AllocFailRecord *allocRecords[2] = { &allocFail, &previousAllocFail };
+  const char *allocKeys[2] = { "allocFail", "allocFailPrev" };
+  for (int i = 0; i < 2; i++) {
+    AllocFailRecord r = *allocRecords[i];
+    r.task[sizeof(r.task) - 1] = 0;
+    JsonArray a = radio[allocKeys[i]].to<JsonArray>();
+    a.add(r.count);
+    a.add(r.size);
+    a.add(r.caps);
+    a.add(r.freeBytes);
+    a.add(r.largestBlock);
+    a.add((const char *)r.task);
+    a.add(r.uptimeSeconds);
+  }
   // Fixed-memory web replies (AnnabelleWifiManager, 2026-10-17)
   radio["replyPeak"] = (uint32_t)wifiManager.getReplyPeakBytes();
   radio["arenaPeak"] = (uint32_t)wifiManager.getArenaPeakBytes();
@@ -905,6 +943,79 @@ void fillTelepathonsJson(JsonDocument &json) {
       }
     }
   }
+}
+
+// ---- Annabelle's own status for the Pi (2026-11-01, firmware 10) ----
+// One extra line in the AsyncData reply, so the Pi treats Annabelle like the devices she hears: a
+// telepathon "Annabelle" with her serial number, stored and sent on to devices.digitalstables.com
+// (AnnabelleStatusDeserializer in the Teleonome framework). Only when something is new since the last
+// one (a packet arrived, the weather forecast went out or failed, the first after a reset), and at
+// least every ANNABELLE_STATUS_HEARTBEAT_MS so a quiet night still shows she is alive.
+// Wire format, '#' separated:
+//   AnnabelleStatusDeserializer#1#name#serialnumber#epoch#uptimeSec#firmwareVersion#
+//   weatherEpoch#weatherDownload#weatherLora#weatherRetries#weatherTrigger#weatherPending#
+//   rxPackets#noPacket#rxDropped#txCount#deafPct#wifiReconnects#wifiDownSecMax#
+//   resetReason#lowMemRestarts#heapFree8#heapMin8#heapBlock#loopMsMax#allocFailCount
+#define ANNABELLE_STATUS_HEARTBEAT_MS 600000UL
+// In RTC memory, not DRAM: v9 left 0 bytes of static DRAM (v10 with these in DRAM overflowed by 8).
+// RTC_NOINIT keeps its value across a reset, so setup() clears it: every boot starts with "not sent".
+struct AnnabelleStatusState {
+  uint32_t sent, rx, weather, ms;
+};
+RTC_NOINIT_ATTR AnnabelleStatusState annabelleStatus;
+
+static bool annabelleStatusDue() {
+  if (serialNumber.length() == 0) return false;
+  if (!annabelleStatus.sent) return true;
+  if (radioStats.rxPackets != annabelleStatus.rx) return true;
+  uint32_t weatherEpoch;
+  portENTER_CRITICAL(&webMux);
+  weatherEpoch = weatherStatus.epoch;
+  portEXIT_CRITICAL(&webMux);
+  if (weatherEpoch != annabelleStatus.weather) return true;
+  return millis() - annabelleStatus.ms >= ANNABELLE_STATUS_HEARTBEAT_MS;
+}
+
+// Returns 1 when a line was sent, 0 otherwise (counted in AsyncData's reply like the other stores).
+static int pushAnnabelleStatusToSerial(Stream &out) {
+  if (!annabelleStatusDue()) return 0;
+  WeatherSendStatus w;
+  portENTER_CRITICAL(&webMux);
+  w = weatherStatus;
+  portEXIT_CRITICAL(&webMux);
+  w.trigger[sizeof(w.trigger) - 1] = 0;
+  uint32_t upMs = millis();
+  float deafPct = upMs ? round(1000.0 * (radioStats.busyMsTotal + radioStats.txMsTotal) / upMs) / 10.0 : 0;
+  out.print("AnnabelleStatusDeserializer#1#Annabelle#");
+  out.print(serialNumber); out.print('#');
+  out.print(heardNow()); out.print('#');
+  out.print(upMs / 1000); out.print('#');
+  out.print(firmwareVersion); out.print('#');
+  out.print(w.epoch); out.print('#');
+  out.print(w.download); out.print('#');
+  out.print(w.lora); out.print('#');
+  out.print(w.retries); out.print('#');
+  out.print(w.epoch ? w.trigger : ""); out.print('#');
+  out.print(weatherPending ? 1 : 0); out.print('#');
+  out.print(radioStats.rxPackets); out.print('#');
+  out.print(radioStats.noPacket); out.print('#');
+  out.print(radioStats.rxDropped); out.print('#');
+  out.print(radioStats.txCount); out.print('#');
+  out.print(deafPct, 1); out.print('#');
+  out.print(radioStats.wifiReconnects); out.print('#');
+  out.print(radioStats.wifiDownSecMax); out.print('#');
+  out.print(resetReason); out.print('#');
+  out.print(resetDiagLowMemRestarts); out.print('#');
+  out.print((uint32_t)heap_caps_get_free_size(MALLOC_CAP_8BIT)); out.print('#');
+  out.print((uint32_t)heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT)); out.print('#');
+  out.print((uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)); out.print('#');
+  out.print(radioStats.loopMsMax); out.print('#');
+  out.println(allocFail.count);
+  annabelleStatus.sent = 1;
+  annabelleStatus.rx = radioStats.rxPackets;
+  annabelleStatus.weather = w.epoch;
+  annabelleStatus.ms = upMs;
+  return 1;
 }
 
 // /TelepathonHistory JSON: the row's cards, newest first. Empty when the row has since been
@@ -1022,6 +1133,9 @@ RTC_NOINIT_ATTR uint32_t resetDiagMinFreeHeap;  // ESP.getMinFreeHeap() as of th
 RTC_NOINIT_ATTR uint8_t resetDiagLoopStage;
 // Planned low-memory restarts since the last power-on (lowMemoryWatchdogTick(), 2026-10-29)
 RTC_NOINIT_ATTR uint32_t resetDiagLowMemRestarts;
+// Last failed memory request (struct and comment near the top, with the other Telepathons externs)
+RTC_NOINIT_ATTR AllocFailRecord allocFail;
+AllocFailRecord previousAllocFail = {};  // allocFail as the last boot left it (count 0 = none, or not known)
 enum LoopStage : uint8_t {
   STAGE_TOP = 1, STAGE_CLOCK, STAGE_WEB_ACTION, STAGE_WEATHER_DOWNLOAD, STAGE_WEATHER_TX, STAGE_DISPLAY,
   STAGE_LORA, STAGE_COMMAND_TX, STAGE_WEATHER_REPLY, STAGE_SERIAL, STAGE_WIFI_RESTART, STAGE_ASYNCDATA,
@@ -1035,6 +1149,28 @@ const char *loopStageName(uint8_t s) {
   return s < sizeof(names) / sizeof(names[0]) ? names[s] : "unknown";
 }
 #define LOOP_STAGE(s) (resetDiagLoopStage = (s))
+// Registered in setup() with heap_caps_register_failed_alloc_callback(). Runs in whichever task
+// asked, after the heap lock is released - it must not allocate.
+void allocFailed(size_t size, uint32_t caps, const char *functionName) {
+  allocFail.count++;
+  allocFail.size = size;
+  allocFail.caps = caps;
+  allocFail.freeBytes = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+  allocFail.largestBlock = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+  allocFail.uptimeSeconds = millis() / 1000;
+  strlcpy(allocFail.task, pcTaskGetName(NULL), sizeof(allocFail.task));
+}
+// " allocFails=<n> allocSize=<bytes> allocCaps=0x.. allocFree=<bytes> allocBlock=<bytes> allocTask=<task>
+// allocAt=<uptime s>" - space separated so decode_crash.sh skips it; "" when there was no failure.
+void formatAllocFail(const AllocFailRecord &r, char *buf, size_t n) {
+  if (!r.count) { buf[0] = 0; return; }
+  char task[sizeof(r.task)];
+  strlcpy(task, r.task, sizeof(task));
+  for (char *c = task; *c; c++) if (*c == ' ' || *c == '|' || *c == '#' || *c == ';') *c = '_';
+  snprintf(buf, n, " allocFails=%lu allocSize=%lu allocCaps=0x%lx allocFree=%lu allocBlock=%lu allocTask=%s allocAt=%lu",
+           (unsigned long)r.count, (unsigned long)r.size, (unsigned long)r.caps, (unsigned long)r.freeBytes,
+           (unsigned long)r.largestBlock, task, (unsigned long)r.uptimeSeconds);
+}
 // Which loop() step fragments the heap (2026-10-17: the largest free block shrinks from ~51 KB at
 // boot while total free memory stays ~86 KB). fragBegin()/fragEnd() around each big step add the
 // change in the largest free block to that step's total; served as "frag" on /Telepathons. What
@@ -2213,6 +2349,8 @@ void recordResetReason(RTCInfoRecord& now) {
     previousLoopStage = resetDiagLoopStage;
     previousUptimeKnown = true;
     resetDiagBootCount++;
+    previousAllocFail = allocFail;
+    previousAllocFail.task[sizeof(previousAllocFail.task) - 1] = 0;
   } else {
     resetDiagMagic = RESET_DIAG_MAGIC;
     resetDiagBootCount = 1;
@@ -2220,14 +2358,18 @@ void recordResetReason(RTCInfoRecord& now) {
   }
   resetDiagUptimeSeconds = 0;
   resetDiagMinFreeHeap = ESP.getMinFreeHeap();
+  memset(&allocFail, 0, sizeof(allocFail));
+  heap_caps_register_failed_alloc_callback(allocFailed);
 
-  char line[160];
-  snprintf(line, sizeof(line), "%04d-%02d-%02d %02d:%02d:%02d reason=%s boot=%lu prevUptime=%s prevMinHeap=%s stage=%s",
+  char allocText[160];
+  formatAllocFail(previousAllocFail, allocText, sizeof(allocText));
+  char line[320];
+  snprintf(line, sizeof(line), "%04d-%02d-%02d %02d:%02d:%02d reason=%s boot=%lu prevUptime=%s prevMinHeap=%s stage=%s%s",
            now.year, now.month, now.date, now.hour, now.minute, now.second,
            resetReason.c_str(), (unsigned long)resetDiagBootCount,
            previousUptimeKnown ? String(previousUptimeSeconds).c_str() : "?",
            previousUptimeKnown ? String(previousMinFreeHeap).c_str() : "?",
-           previousUptimeKnown ? loopStageName(previousLoopStage) : "?");
+           previousUptimeKnown ? loopStageName(previousLoopStage) : "?", allocText);
   resetDiagLoopStage = 0;
 
   // Keep only the newest lines so the log can't grow without bound
@@ -2319,6 +2461,10 @@ void recordCoreDump(RTCInfoRecord& now) {
     line += buf;
   }
   free(summary);
+  // The last failed memory request before the panic (allocFailed()), if there was one
+  char allocText[160];
+  formatAllocFail(previousAllocFail, allocText, sizeof(allocText));
+  line += allocText;
 
   line.replace("|", "/");
   line.replace("#", "/");
@@ -2577,6 +2723,7 @@ void tickBoardTemperature(uint8_t second) {
 }
 
 void setup() {
+  annabelleStatus = {};  // Annabelle's status line starts "not sent" on every boot (RTC_NOINIT, see above)
   pinMode(WDT_DONE_PIN, OUTPUT);
   digitalWrite(WDT_DONE_PIN, LOW);
   xTaskCreatePinnedToCore(watchdogTask, "tplWatchdog", 2048, NULL, 2, &watchdogTaskHandle, 0);
@@ -3223,7 +3370,9 @@ void loop() {
       // Must be checked before "AsyncData" below (startsWith would match both).
       // Non-destructive peek so the Pi knows how many lines to read before it
       // actually asks for the data with AsyncData.
-      Serial.println(dataManager.getPendingQueueItemCount() + vitalSignsStore.pendingCount() + deviceIdentityStore.pendingCount() + powerProfileStore.pendingCount());
+      // + 1 when Annabelle's own status line will go too (pushAnnabelleStatusToSerial, 2026-11-01)
+      Serial.println(dataManager.getPendingQueueItemCount() + vitalSignsStore.pendingCount() + deviceIdentityStore.pendingCount() + powerProfileStore.pendingCount()
+                     + (annabelleStatusDue() ? 1 : 0));
       //
       // Per-type available/dropped/flash-health breakdown, added 2026-08-04
       // for capacity planning as device counts grow (many Daffodils, several
@@ -3343,6 +3492,7 @@ void loop() {
       int vitalDownloaded = vitalSignsStore.pushPendingToSerial(Serial);
       int identityDownloaded = deviceIdentityStore.pushPendingToSerial(Serial);
       int powerDownloaded = powerProfileStore.pushPendingToSerial(Serial);
+      int statusDownloaded = pushAnnabelleStatusToSerial(Serial);
 
       Serial.print("Ok-AsyncData#");
       Serial.print("DS="); Serial.print(dsDownloaded);
@@ -3354,6 +3504,7 @@ void loop() {
       Serial.print("|Vital="); Serial.print(vitalDownloaded);
       Serial.print("|Identity="); Serial.print(identityDownloaded);
       Serial.print("|Power="); Serial.print(powerDownloaded);
+      Serial.print("|Annabelle="); Serial.print(statusDownloaded);
       //
       // Reset diagnostics ride on the AsyncData terminator so the Hypothalamus
       // records them every Async Cycle (generic to any microcontroller):
