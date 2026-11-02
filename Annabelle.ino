@@ -42,7 +42,7 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 
 // Shown on the OLED at start-up, answered to the Pi's GetFirmware and in GetWebData (like Cleotilde).
 // Add 1 to firmwareVersion with every flashed change; the build time tells two builds of one version apart.
-const int firmwareVersion = 10;
+const int firmwareVersion = 11;
 #define FIRMWARE_BUILD_TIME __DATE__ " " __TIME__
 
 // Display settings for 2.4" SSD1309 — same OLED hardware as Paula
@@ -955,7 +955,9 @@ void fillTelepathonsJson(JsonDocument &json) {
 //   AnnabelleStatusDeserializer#1#name#serialnumber#epoch#uptimeSec#firmwareVersion#
 //   weatherEpoch#weatherDownload#weatherLora#weatherRetries#weatherTrigger#weatherPending#
 //   rxPackets#noPacket#rxDropped#txCount#deafPct#wifiReconnects#wifiDownSecMax#
-//   resetReason#lowMemRestarts#heapFree8#heapMin8#heapBlock#loopMsMax#allocFailCount
+//   resetReason#lowMemRestarts#heapFree8#heapMin8#heapBlock#loopMsMax#allocFailCount#
+//   latitude#longitude   (added in firmware 11, still format 1: the framework before it reads the first
+//   27 tokens and ignores the rest; her position, Settings > GPS or the built-in one, for the map)
 #define ANNABELLE_STATUS_HEARTBEAT_MS 600000UL
 // In RTC memory, not DRAM: v9 left 0 bytes of static DRAM (v10 with these in DRAM overflowed by 8).
 // RTC_NOINIT keeps its value across a reset, so setup() clears it: every boot starts with "not sent".
@@ -1010,7 +1012,9 @@ static int pushAnnabelleStatusToSerial(Stream &out) {
   out.print((uint32_t)heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT)); out.print('#');
   out.print((uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)); out.print('#');
   out.print(radioStats.loopMsMax); out.print('#');
-  out.println(allocFail.count);
+  out.print(allocFail.count); out.print('#');
+  out.print(annabelleData.latitude, 6); out.print('#');
+  out.println(annabelleData.longitude, 6);
   annabelleStatus.sent = 1;
   annabelleStatus.rx = radioStats.rxPackets;
   annabelleStatus.weather = w.epoch;
