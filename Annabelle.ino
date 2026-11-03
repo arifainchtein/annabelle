@@ -33,6 +33,7 @@
 #include <PowerProfileStore.h>
 #include <DeviceCommandRecord.h>
 #include <DeviceCommandQueue.h>
+#include <LinkAckRecord.h>
 #include "HeardEntry.h"
 #include <Preferences.h>
 #include <esp_system.h>
@@ -42,7 +43,8 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 
 // Shown on the OLED at start-up, answered to the Pi's GetFirmware and in GetWebData (like Cleotilde).
 // Add 1 to firmwareVersion with every flashed change; the build time tells two builds of one version apart.
-const int firmwareVersion = 11;
+// 12 = 2026-11-03: answers Paula's signal-survey ping (handlePing, LinkAckRecord).
+const int firmwareVersion = 12;
 #define FIRMWARE_BUILD_TIME __DATE__ " " __TIME__
 
 // Display settings for 2.4" SSD1309 — same OLED hardware as Paula
@@ -189,7 +191,8 @@ constexpr size_t loraPacketSizes[] = {
   sizeof(LangleyData), sizeof(GloriaTankFlowPumpData), sizeof(DigitalStablesData), sizeof(ChinampaData),
   sizeof(SeedlingMonitorData), sizeof(CommaRecord), sizeof(VitalSignsRecord), sizeof(WeatherForecastUpdate),
   sizeof(GraveyardShiftUpdate), sizeof(RequestCommand), sizeof(DeviceIdentityRecord),
-  sizeof(VitalSignsRecordV2), sizeof(VitalSignsRecordV3), sizeof(PowerProfileRecord), sizeof(DeviceCommandRecord)
+  sizeof(VitalSignsRecordV2), sizeof(VitalSignsRecordV3), sizeof(PowerProfileRecord), sizeof(DeviceCommandRecord),
+  sizeof(LinkAckRecord)
 };
 static_assert(LoRaPacketSizeCheck::allDistinct(loraPacketSizes, sizeof(loraPacketSizes) / sizeof(loraPacketSizes[0]), 0, 1),
               "two LoRa packet structs have the same size - receivers dispatch on size, so they would be confused");
@@ -1545,6 +1548,64 @@ void handleVitalSigns(const VitalSignsRecord &record, bool checksumOk) {
   }
 }
 
+// ---- Signal survey ping (2026-11-03) ----
+// Paula's Nearby Devices map pings (DEVICE_COMMAND_PING, to every device) to ask "who hears me from
+// here?". Annabelle is the gateway, so its answer is THE answer: it says how strongly it heard the
+// ping - at a Daffodil's 5 dBm by default - i.e. whether a device placed where Paula stands would
+// reach it. Checked like any command (checksum, code for senderTime, clock), with the replay check in
+// RAM since nothing is changed by it. Answered from loop() LINK_ACK_FIRST_SLOT_MS later (before the
+// Daffodils' slots - LinkAckRecord.h), never from inside processLora.
+// On the heap, made at the first ping: static DRAM (.dram0.bss) was only ~8 bytes from full when this
+// was added (2026-11-03 - 64 bytes of plain globals overflowed it by 56), so only the pointer is static.
+#define PING_MAX_CLOCK_DIFF_SEC 900
+struct PingAnswerState {
+  uint32_t lastSenderTime = 0;
+  uint32_t dueMs = 0;
+  bool pending = false;
+  LinkAckRecord ack;
+};
+PingAnswerState *pingState = nullptr;
+
+void handlePing(const DeviceCommandRecord &c, int rssi, float snr) {
+  if (deviceCommandChecksum(c) != c.checksum || !isBroadcastPing(c.serialnumberarray, c.command)) return;
+  if (c.senderTime == 0 || secretManager.generateCodeAt(c.senderTime) != c.totpcode) {
+    if (debug) Serial.println("ping: code does not match senderTime");
+    return;
+  }
+  long now = timeManager.getTimeForCodeGeneration();
+  if (labs((long)c.senderTime - now) > PING_MAX_CLOCK_DIFF_SEC) {
+    if (debug) Serial.printf("ping: sender clock %ld s off\n", (long)c.senderTime - now);
+    return;
+  }
+  if (!pingState) {
+    pingState = new (std::nothrow) PingAnswerState();
+    if (!pingState) return;
+  }
+  if (c.senderTime <= pingState->lastSenderTime) return;  // the same ping again
+  pingState->lastSenderTime = c.senderTime;
+  LinkAckRecord a;
+  a.probeTime = c.senderTime;
+  a.probeSeq = (uint16_t)(c.reserved[0] | (c.reserved[1] << 8));
+  memcpy(a.serialnumberarray, annabelleData.serialnumberarray, 8);
+  strncpy(a.devicename, "Annabelle", sizeof(a.devicename) - 1);
+  a.kind = LINK_ACK_KIND_ANNABELLE;
+  a.probeRssi = (int16_t)rssi;
+  a.probeSnrQ = (int8_t)lroundf(snr * 4);
+  a.latitude = annabelleData.latitude;
+  a.longitude = annabelleData.longitude;
+  linkAckSeal(a);
+  pingState->ack = a;
+  pingState->dueMs = millis() + linkAckDelayMs(a.serialnumberarray, true);
+  pingState->pending = true;
+  if (debug) Serial.printf("ping %u #%u from sender %u heard at %d dBm, SNR %.1f - answering\n", c.senderTime, a.probeSeq, c.sender, rssi, snr);
+}
+
+void sendPendingLinkAck() {
+  if (!pingState || !pingState->pending || (int32_t)(millis() - pingState->dueMs) < 0) return;
+  pingState->pending = false;
+  sendMessage(pingState->ack);
+}
+
 void processLora(int packetSize) {
   if (debug) Serial.println("Received lora size=" + String(packetSize));
   if (packetSize == 0) return;  // if there's no packet, return
@@ -1753,6 +1814,16 @@ void processLora(int packetSize) {
       powerProfileStore.store(powerProfileRecord, rxPacketRssi(), rxPacketSnr());
     }
     notePowerProfilePacket(powerProfileRecord, checksumOk, rxPacketRssi(), rxPacketSnr());
+  } else if (packetSize == sizeof(DeviceCommandRecord)) {
+    // Annabelle sends these; the only one it acts on is Paula's ping (handlePing).
+    DeviceCommandRecord command;
+    rxPacketRead((uint8_t*)&command, sizeof(DeviceCommandRecord));
+    handlePing(command, rxPacketRssi(), rxPacketSnr());
+  } else if (packetSize == sizeof(LinkAckRecord)) {
+    // Another device answering Paula's ping - for Paula, nothing to do here.
+    LinkAckRecord ack;
+    rxPacketRead((uint8_t*)&ack, sizeof(LinkAckRecord));
+    if (debug) Serial.printf("ping answer from %.16s (%s)\n", ack.devicename, linkAckValid(ack) ? "ok" : "BAD");
   }
 }
 
@@ -3074,6 +3145,7 @@ void loop() {
     lastLoopMs = nowMs;
   }
   radioHistoryTick();
+  sendPendingLinkAck();  // Paula's ping, answered LINK_ACK_FIRST_SLOT_MS after it was heard
   LOOP_STAGE(STAGE_TOP);
   if (!fragBootBlock) fragBootBlock = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
 
