@@ -192,7 +192,7 @@ constexpr size_t loraPacketSizes[] = {
   sizeof(SeedlingMonitorData), sizeof(CommaRecord), sizeof(VitalSignsRecord), sizeof(WeatherForecastUpdate),
   sizeof(GraveyardShiftUpdate), sizeof(RequestCommand), sizeof(DeviceIdentityRecord),
   sizeof(VitalSignsRecordV2), sizeof(VitalSignsRecordV3), sizeof(PowerProfileRecord), sizeof(DeviceCommandRecord),
-  sizeof(LinkAckRecord)
+  sizeof(LinkAckRecord), sizeof(WeatherForecast8Update)
 };
 static_assert(LoRaPacketSizeCheck::allDistinct(loraPacketSizes, sizeof(loraPacketSizes) / sizeof(loraPacketSizes[0]), 0, 1),
               "two LoRa packet structs have the same size - receivers dispatch on size, so they would be confused");
@@ -1367,7 +1367,7 @@ int sendMessage(const T& inputData) {
   while (keepGoing) {
     cadResult = performCAD();
     if (cadResult == LORA_OK) {
-      if constexpr (std::is_same<T, WeatherForecastUpdate>::value) {
+      if constexpr (std::is_same<T, WeatherForecastUpdate>::value || std::is_same<T, WeatherForecast8Update>::value) {
         // Stamped here, after any CAD back-off, and the code calculated at that same time so
         // receivers can check it without trusting their own clocks.
         dataToSend.annabelleTime = (uint32_t)(timeManager.getTimeForCodeGeneration() + WEATHER_AIRTIME_SEC);
@@ -1440,18 +1440,29 @@ int sendMessage(const T& inputData) {
 // up on the download - getInternetAvailable() only reflects the last ping, and one failed ping
 // (e.g. at boot, before DHCP/DNS settled) would otherwise latch false and stop every download.
 // Mirrors Daffodil.ino's recheck-on-reconnect handling. The outcome goes to weatherStatus.
-// Sends the 4 forecast entries as a WeatherForecastUpdate, with the blue LED show. loop() only.
+// Sends the forecast, with the blue LED show. loop() only. Two packets (2026-11-07): first all 8
+// slots (24 h) as a WeatherForecast8Update, then the first 4 as the old WeatherForecastUpdate for
+// receivers that don't know the 8-slot packet yet - updated receivers ignore that one when they
+// have just had the 8. Drop the second send once every device in the field is updated. Returns
+// the 8-slot send's result unless only the 4-slot one went out.
 int broadcastForecast(WeatherForecast *forecasts) {
+  WeatherForecast8Update update8;
+  for (int i = 0; i < WEATHER_FORECAST8_SLOTS; i++) update8.forecasts[i] = weatherForecastToSlot(forecasts[i]);
   WeatherForecastUpdate weatherForecastUpdate;
   for (int i = 0; i < 4; i++) weatherForecastUpdate.forecasts[i] = forecasts[i];
-  weatherForecastUpdate.totpcode = secretManager.generateCode();
-  if (debug) Serial.print("sending weather via LoRa, size=");
-  if (debug) Serial.println(sizeof(WeatherForecastUpdate));
+  if (debug) Serial.printf("sending weather via LoRa, sizes %u and %u\n", (unsigned)sizeof(WeatherForecast8Update), (unsigned)sizeof(WeatherForecastUpdate));
   currentPalette = weatherSendPalette;
   currentBlending = LINEARBLEND;
   ledShowDuration = 2000;
   runLedShow = true;
-  return sendMessage(weatherForecastUpdate);  // ends in RX mode; loop polls for packets
+  int result8 = sendMessage(update8);  // totpcode/annabelleTime are stamped in sendMessage()
+  int retries8 = lastSendRetries;
+  int result4 = sendMessage(weatherForecastUpdate);  // ends in RX mode; loop polls for packets
+  if (result8 == LORA_OK || result4 != LORA_OK) {
+    lastSendRetries = retries8;
+    return result8;
+  }
+  return result4;
 }
 
 // The weather-on-request reply (see weatherReplyPending): cached forecast, no download, and
