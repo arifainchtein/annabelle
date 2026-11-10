@@ -24,7 +24,7 @@ var CARD_TYPES = {
     8: { name: "Comma record", checksum: true, f: [["Voltage", "V", 2], ["Index", "", 0], ["Total", "", 0]], tabs: "ppp" },
     9: { name: "Power profile", checksum: true, f: [["Capacity", "mAh", 0]], tabs: "p" },
     10: { name: "Link health", checksum: true, f: [["Delivered here", "%", 0], ["Data sent", "", 0], ["Data scheduled", "", 0],
-        ["Gave up, channel busy", "", 0], ["Missed send slots", "", 0], ["Noise floor", "dBm", 0], ["Hears Annabelle at", "dBm", 0],
+        ["Busy on every check", "", 0], ["Missed send slots", "", 0], ["Noise floor", "dBm", 0], ["Hears Annabelle at", "dBm", 0],
         ["Annabelle SNR", "dB", 1], ["CRC errors", "", 0]], tabs: "rrrrrrrrr" }
 };
 
@@ -46,7 +46,8 @@ var FUNCTIONS = {
     10: { name: "Voltage monitor", f: [["Sensor 1", "V", 2]] },
     11: { name: "Water trough and tank", f: [TROUGH, TANK1] },
     12: { name: "Two water troughs", f: [TROUGH, ["Trough 2 level", "cm", 0]] },
-    13: { name: "Water trough and water temperature", f: [TROUGH, ["Water temperature", "°C", 1]] }
+    13: { name: "Water trough and water temperature", f: [TROUGH, ["Water temperature", "°C", 1]] },
+    15: { name: "Water trough (echo/trigger ultrasonic)", f: [TROUGH, ["Trough minimum", "cm", 0], ["Trough maximum", "cm", 0]] }
 };
 // Flow totals as the Daffodil's own page shows them: ml up to 1 L, then litres.
 function mlText(v) {
@@ -187,6 +188,15 @@ function ageColor(sec, card) {
     return "#c62828";
 }
 
+// How a packet arrived (2026-11-11) - card.via is the name in its sentbyarray ("Chinamp", "Paula"...);
+// absent = sentbyarray was empty, the device sent it itself. Only data packets (Daffodil, Chinampa)
+// carry a sentby, so only they say "direct".
+function hasSentBy(card) { return card && (card.ty === 1 || card.ty === 2); }
+function viaText(card) {
+    if (!hasSentBy(card)) return "";
+    return card.via ? ' · <span class="tp-via">via ' + esc(card.via) + "</span>" : ' · <span class="tp-direct">direct</span>';
+}
+
 function row(label, value) {
     return '<div class="hc-row"><span>' + label + "</span><span>" + value + "</span></div>";
 }
@@ -203,7 +213,7 @@ function tabSection(card, tab, nowSec) {
         if (text !== null) html += row(field[0], text);
     });
     if (!html) return "";
-    return '<div class="hc-sub">' + esc(type.name) + " · " + fmtAgo(nowSec - card.t)
+    return '<div class="hc-sub">' + esc(type.name) + " · " + fmtAgo(nowSec - card.t) + viaText(card)
         + (card.ok ? "" : ' · <span class="bad">' + (type.checksum ? "checksum failed" : "name or clock not believable") + "</span>") + "</div>" + html;
 }
 
@@ -228,7 +238,7 @@ function cardBody(t, card, nowSec, isFront) {
     var age = nowSec - card.t;
     var html = '<div class="hc-age" style="color:' + (isFront ? ageColor(age, dataCard) : "#555") + '">'
         + (isFront ? "Last heard " : esc((CARD_TYPES[card.ty] || { name: "Type " + card.ty }).name) + " · ")
-        + fmtAgo(age) + " (" + fmtDateTime(card.t) + ")</div>";
+        + fmtAgo(age) + " (" + fmtDateTime(card.t) + ")" + viaText(isFront ? (dataCard || card) : card) + "</div>";
     if (dataCard && dataCard.ty === 1 && dataCard.v && (dataCard.v[7] & 1)) html += '<div class="tp-warn">USB jumper fitted</div>';  // opMode bit 0
     html += '<div class="hc-tabs">' + Object.keys(TAB_NAMES).map(function (k) {
         return '<button type="button" class="' + (k === tab ? "active" : "") + '" data-tab="' + k + '" data-name="' + esc(t.name) + '">' + TAB_NAMES[k] + "</button>";
@@ -238,6 +248,8 @@ function cardBody(t, card, nowSec, isFront) {
         if (t.sync && isFront) body += syncLine(t.sync);
         if (t.wifi && isFront) body += wifiLine(t);
         body += row("Signal", card.rssi + " dBm, SNR " + Number(card.snr).toFixed(1));
+        var rx = hasSentBy(card) ? card : (isFront && t.data && hasSentBy(t.data) ? t.data : null);
+        if (rx) body += row("Received", rx.via ? '<span class="tp-via">via ' + esc(rx.via) + "</span>" : "direct from the device");
     }
     if (tab === "s" && t.fn && isFront) body += functionRows(t);
     cards.forEach(function (c) { if (c) body += tabSection(c, tab, nowSec); });

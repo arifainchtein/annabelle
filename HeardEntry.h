@@ -10,6 +10,12 @@
 #define DAFFODIL_SENSORS 7   // board temperature, outdoor temperature and humidity + up to 4 function readings
 #define CARD_VALUES 9   // Daffodil and VitalSigns cards send 9 - noteSync() reads v[8], the Daffodil clock offset
 
+// Relays seen in packets' sentbyarray (2026-11-11) - any device may relay (Chinampa does, Paula when
+// testing), so their names are learnt, not assumed. HeardCard.via 1..RELAY_NAMES_MAX picks one;
+// RELAY_VIA_UNNAMED = a relay whose name didn't fit the table.
+#define RELAY_NAMES_MAX 8
+#define RELAY_VIA_UNNAMED (RELAY_NAMES_MAX + 1)
+
 // Packet types on a card - telepathons.js has the matching labels (CARD_TYPES).
 enum HeardCardType : uint8_t {
   CARD_DAFFODIL = 1, CARD_CHINAMPA, CARD_LANGLEY, CARD_GLORIA, CARD_SEEDLING,
@@ -21,7 +27,11 @@ enum HeardCardType : uint8_t {
 struct HeardCard {
   uint32_t epoch;   // Annabelle RTC
   uint8_t type;     // HeardCardType
-  bool ok;          // checksum matched, or (types without one) name and clock look sane
+  bool ok : 1;      // checksum matched, or (types without one) name and clock look sane
+  // Who resent it (2026-11-11), from the packet's sentbyarray: 0 = empty sentby (sent by the device
+  // itself), else 1 + its index in Annabelle.ino's relayNames. Packed into ok's byte - no RAM added
+  // (the cards fill static RAM). Only DigitalStablesData and ChinampaData have a sentbyarray.
+  uint8_t via : 7;
   int16_t rssi;
   float snr;
   float v[CARD_VALUES];

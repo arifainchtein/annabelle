@@ -46,6 +46,8 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 // Add 1 to firmwareVersion with every flashed change; the build time tells two builds of one version apart.
 // 12 = 2026-11-03: answers Paula's signal-survey ping (handlePing, LinkAckRecord).
 // 13 = 2026-11-10: reads LinkHealthRecord (link diagnosis) - a "Link health" card with the delivery ratio.
+//      2026-11-11: each card says who resent the packet - the name in its sentbyarray ("via Chinamp"
+//      on the page); nothing when sentbyarray is empty, i.e. the device sent it itself.
 const int firmwareVersion = 13;
 #define FIRMWARE_BUILD_TIME __DATE__ " " __TIME__
 
@@ -532,6 +534,27 @@ static void noteSync(HeardEntry *e, uint32_t epoch, int opMode, float off) {
   e->offsetKnown = true;
 }
 
+// Relay names seen in sentbyarray (HeardEntry.h RELAY_NAMES_MAX), learnt as they appear.
+static char relayNames[RELAY_NAMES_MAX][9];
+
+// sentbyarray -> HeardCard.via for the next noteCard (set by the DigitalStablesData / ChinampaData
+// callers just before it, cleared by it - noteCard's own signature stays the same for every caller).
+// Called with heardMux free (noteCard takes it after this has been used).
+static uint8_t nextCardVia = 0;
+
+static uint8_t viaFromSentBy(const uint8_t *sentby) {
+  char name[9];
+  memcpy(name, sentby, 8);
+  name[8] = 0;
+  for (int i = 0; i < 8; i++) if (name[i] && (name[i] < 32 || name[i] > 126)) name[i] = '?';  // shown on the page
+  if (!name[0]) return 0;  // empty: the device sent it itself
+  for (int i = 0; i < RELAY_NAMES_MAX; i++) {
+    if (strcmp(relayNames[i], name) == 0) return i + 1;
+    if (!relayNames[i][0]) { strcpy(relayNames[i], name); return i + 1; }
+  }
+  return RELAY_VIA_UNNAMED;
+}
+
 // Records one packet on its device's row. kind null keeps the row's (serial-only records).
 static void noteCard(const char *rawName, size_t nameLen, const uint8_t *serial, const char *kind, HeardCardType type,
                      bool ok, int rssi, float snr, const float *v, int nv) {
@@ -541,6 +564,8 @@ static void noteCard(const char *rawName, size_t nameLen, const uint8_t *serial,
   card.epoch = heardNow();
   card.type = type;
   card.ok = ok;
+  card.via = nextCardVia;
+  nextCardVia = 0;
   card.rssi = rssi;
   card.snr = snr;
   for (int i = 0; i < CARD_VALUES; i++) card.v[i] = i < nv ? v[i] : NAN;
@@ -594,7 +619,8 @@ static void daffodilSensors(const DigitalStablesData &d, float out[DAFFODIL_SENS
     case FUN_1_TANK: f[0] = d.tank1PressurePsi; break;
     case FUN_2_TANK: f[0] = d.tank1PressurePsi; f[1] = d.tank2PressurePsi; break;
     case DAFFODIL_SCEPTIC_TANK: f[0] = d.measuredHeight; f[1] = d.maximumScepticHeight; break;
-    case DAFFODIL_WATER_TROUGH: f[0] = d.measuredHeight; f[1] = d.troughlevelminimumcm; f[2] = d.troughlevelmaximumcm; break;
+    case DAFFODIL_WATER_TROUGH:
+    case DAFFODIL_SONAR_TROUGH: f[0] = d.measuredHeight; f[1] = d.troughlevelminimumcm; f[2] = d.troughlevelmaximumcm; break;
     // DAFFODIL_TEMP_SOILMOISTURE: its outdoor temperature/humidity are already in out[1], out[2]
     case VOLTAGE_MONITOR: f[0] = d.flowRate; break;  // the voltage on sensor 1 (Daffodil.ino reads it into flowRate)
     case DAFFODIL_WATER_TROUGH_TANK1: f[0] = d.measuredHeight; f[1] = d.tank1PressurePsi; break;
@@ -607,6 +633,7 @@ void noteDigitalStablesPacket(const DigitalStablesData &d, bool ok) {
   float v[] = { d.batteryVoltage, d.batteryCurrent, d.panelVoltage, d.panelCurrent, d.v50Voltage,
                 (float)d.operatingStatus, (float)d.sleepTime, (float)d.opMode, clockOffset(d.secondsTime) };
   static_assert(sizeof(v) / sizeof(v[0]) <= CARD_VALUES, "more values than a HeardCard holds");
+  nextCardVia = viaFromSentBy(d.sentbyarray);
   noteCard(d.devicename, sizeof(d.devicename), d.serialnumberarray, "Daffodil", CARD_DAFFODIL, ok, (int)d.rssi, d.snr, v, 9);
   if (ok) {
     noteSyncAndWifi(d.devicename, sizeof(d.devicename), d.serialnumberarray, d.opMode, v[8], d.wifiStatus);
@@ -626,6 +653,7 @@ void noteChinampaPacket(const ChinampaData &d, bool ok) {
   float v[] = { d.fishTankMeasuredHeight, d.sumpTroughMeasuredHeight, d.rtcBatVolt, (float)d.microtemperature, d.lux,
                 (float)d.alertcode, clockOffset(d.secondsTime) };
   static_assert(sizeof(v) / sizeof(v[0]) <= CARD_VALUES, "more values than a HeardCard holds");
+  nextCardVia = viaFromSentBy(d.sentbyarray);
   noteCard(d.devicename, sizeof(d.devicename), d.serialnumberarray, "Chinampa", CARD_CHINAMPA, ok, (int)d.rssi, d.snr, v, 7);
 }
 
@@ -695,7 +723,7 @@ void noteLinkHealthPacket(const LinkHealthRecord &r, bool ok, int rssi, float sn
     e->linkDataHeardAt = e->dataHeard;
     portEXIT_CRITICAL(&heardMux);
   }
-  float v[] = { delivery, (float)r.dataSent, (float)r.dataScheduled, (float)r.busyAbandoned, (float)r.slotsMissed,
+  float v[] = { delivery, (float)r.dataSent, (float)r.dataScheduled, (float)r.busyExhausted, (float)r.slotsMissed,
                 r.noiseMedian == LINK_HEALTH_NO_NOISE ? NAN : (float)r.noiseMedian,
                 r.gatewayAgeSec == LINK_HEALTH_UNKNOWN_AGE ? NAN : (float)r.gatewayRssi,
                 r.gatewayAgeSec == LINK_HEALTH_UNKNOWN_AGE ? NAN : r.gatewaySnrQ / 4.0f,
@@ -703,14 +731,16 @@ void noteLinkHealthPacket(const LinkHealthRecord &r, bool ok, int rssi, float sn
   static_assert(sizeof(v) / sizeof(v[0]) <= CARD_VALUES, "more values than a HeardCard holds");
   noteCard(nullptr, 0, r.serialnumberarray, nullptr, CARD_LINK, ok, rssi, snr, v, 9);
   if (debug) Serial.printf("LinkHealth #%u sent=%u/%u busy=%u failed=%u missed=%u noise=%d gw=%d delivery=%.0f%% (%s)\n",
-                           r.seq, r.dataSent, r.dataScheduled, r.busyAbandoned, r.txFailed, r.slotsMissed, r.noiseMedian,
+                           r.seq, r.dataSent, r.dataScheduled, r.busyExhausted, r.txFailed, r.slotsMissed, r.noiseMedian,
                            r.gatewayRssi, delivery, ok ? "ok" : "BAD");
 }
 
 static void cardJson(JsonObject o, const HeardCard &c) {
   o["t"] = c.epoch;
   o["ty"] = c.type;
-  o["ok"] = c.ok;
+  o["ok"] = (bool)c.ok;
+  // who resent it - left out when sentbyarray was empty (the device sent it itself)
+  if (c.via) o["via"] = c.via <= RELAY_NAMES_MAX ? relayNames[c.via - 1] : "a relay";
   o["rssi"] = c.rssi;
   o["snr"] = c.snr;
   JsonArray v = o["v"].to<JsonArray>();
