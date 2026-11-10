@@ -1,0 +1,14 @@
+# Name,   Type, SubType, Offset,   Size,     Flags
+# Annabelle's website gets its own "www" partition (2026-11-11), the same layout as Daffodil's: a
+# release (ProjectWallLabelMaker) then packs data/ into Annabelle.www.bin and the deploy flashes it
+# with the firmware, so a page update never touches the data LittleFS (the queue for the Pi, the
+# reset log) again. nvs, otadata, app0 and spiffs are byte-for-byte the same as
+# PartitionScheme=default_8MB, so Annabelle keeps her Preferences (NVS) and her LittleFS queue across
+# the change. app1 (OTA slot, never used - no OTA code in this firmware) shrinks to make room for www.
+nvs,      data, nvs,     0x9000,   0x5000,
+otadata,  data, ota,     0xe000,   0x2000,
+app0,     app,  ota_0,   0x10000,  0x330000,
+app1,     app,  ota_1,   0x340000, 0x1B0000,
+www,      data, spiffs,  0x4F0000, 0x180000,
+spiffs,   data, spiffs,  0x670000, 0x180000,
+coredump, data, coredump,0x7F0000, 0x10000,

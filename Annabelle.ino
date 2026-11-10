@@ -46,6 +46,7 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 // Add 1 to firmwareVersion with every flashed change; the build time tells two builds of one version apart.
 // 12 = 2026-11-03: answers Paula's signal-survey ping (handlePing, LinkAckRecord).
 // 13 = 2026-11-10: reads LinkHealthRecord (link diagnosis) - a "Link health" card with the delivery ratio.
+//      2026-11-11: own "www" partition for the website (partitions.csv) - releases now ship it.
 //      2026-11-11: each card says who resent the packet - the name in its sentbyarray ("via Chinamp"
 //      on the page); nothing when sentbyarray is empty, i.e. the device sent it itself.
 const int firmwareVersion = 13;
@@ -222,6 +223,10 @@ Esp32SecretManager secretManager(timeManager);
 String secret;
 
 AnnabelleWifiManager wifiManager(Serial, LittleFS, dataManager, timeManager, secretManager, annabelleData);
+// The website's own read-only "www" partition (partitions.csv, 2026-11-11), flashed with each release
+// as Annabelle.www.bin. setup() serves the page from it once it holds index.html.gz; until then (a
+// USB flash without the www image) the page is still served from the data LittleFS, as before.
+fs::LittleFSFS wwwFS;
 
 byte msgCount = 0;  // count of outgoing messages
 
@@ -3044,6 +3049,13 @@ void setup() {
   wifiManager.setWebDataExtras(addWebDataExtras);
   wifiManager.setSettingsAction(queueWebAction);
   wifiManager.pingVerbose = debug;  // its ping lines went to the Pi's serial line
+  // Page from the www partition when its image is there, else from the data LittleFS (2026-11-11)
+  if (wwwFS.begin(false, "/www", 4, "www") && wwwFS.exists("/index.html.gz")) {
+    wifiManager.setWebFs(wwwFS);
+    if (debug) Serial.println("Web page from the www partition");
+  } else {
+    if (debug) Serial.println("www partition empty or missing - web page from LittleFS");
+  }
   wifiManager.start();
   bool stationmode = wifiManager.getStationMode();
   wifiStationWanted = stationmode && wifiManager.getSSID() != "";
