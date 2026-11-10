@@ -22,7 +22,10 @@ var CARD_TYPES = {
         ["TX duration", "ms", 0], ["TX failures", "", 0], ["Wake drift", "s", 0], ["Last awake", "s", 0], ["Wakes", "", 0]], tabs: "prpprrppp" },
     7: { name: "Identity", checksum: true, f: [] },
     8: { name: "Comma record", checksum: true, f: [["Voltage", "V", 2], ["Index", "", 0], ["Total", "", 0]], tabs: "ppp" },
-    9: { name: "Power profile", checksum: true, f: [["Capacity", "mAh", 0]], tabs: "p" }
+    9: { name: "Power profile", checksum: true, f: [["Capacity", "mAh", 0]], tabs: "p" },
+    10: { name: "Link health", checksum: true, f: [["Delivered here", "%", 0], ["Data sent", "", 0], ["Data scheduled", "", 0],
+        ["Gave up, channel busy", "", 0], ["Missed send slots", "", 0], ["Noise floor", "dBm", 0], ["Hears Annabelle at", "dBm", 0],
+        ["Annabelle SNR", "dB", 1], ["CRC errors", "", 0]], tabs: "rrrrrrrrr" }
 };
 
 // Daffodil functions (config switch, DigitalStablesData.h FUN_*/DAFFODIL_*): the name and the labels of
@@ -205,7 +208,7 @@ function tabSection(card, tab, nowSec) {
 }
 
 // The card's tabs (2026-10-23). Front of the stack: the newest data packet, the newest vital signs
-// and whatever else came last (fillTelepathonsJson "front", "data", "vital"). Further back: that one
+// the newest link health and whatever else came last (fillTelepathonsJson "front", "data", "vital", "link"). Further back: that one
 // packet, split the same way.
 var TAB_NAMES = { s: "Sensors", p: "Power", r: "Radio" };
 var cardTab = {};   // device name -> s/p/r, remembered on this phone
@@ -216,9 +219,9 @@ function isData(c) { return c && c.ty >= 1 && c.ty <= 5; }
 function cardBody(t, card, nowSec, isFront) {
     var cards = [card];
     if (isFront) {
-        var data = isData(card) ? card : t.data, vital = card.ty === 6 ? card : t.vital;
-        cards = [data, vital];
-        if (card !== data && card !== vital) cards.push(card);  // comma record, power profile, identity
+        var data = isData(card) ? card : t.data, vital = card.ty === 6 ? card : t.vital, link = card.ty === 10 ? card : t.link;
+        cards = [data, vital, link];
+        if (card !== data && card !== vital && card !== link) cards.push(card);  // comma record, power profile, identity
     }
     var dataCard = cards[0] && isData(cards[0]) ? cards[0] : null;
     var tab = cardTab[t.name] || "s";

@@ -34,6 +34,7 @@
 #include <DeviceCommandRecord.h>
 #include <DeviceCommandQueue.h>
 #include <LinkAckRecord.h>
+#include <LinkHealthRecord.h>  // 2026-11-10, see noteLinkHealthPacket
 #include "HeardEntry.h"
 #include <Preferences.h>
 #include <esp_system.h>
@@ -44,7 +45,8 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 // Shown on the OLED at start-up, answered to the Pi's GetFirmware and in GetWebData (like Cleotilde).
 // Add 1 to firmwareVersion with every flashed change; the build time tells two builds of one version apart.
 // 12 = 2026-11-03: answers Paula's signal-survey ping (handlePing, LinkAckRecord).
-const int firmwareVersion = 12;
+// 13 = 2026-11-10: reads LinkHealthRecord (link diagnosis) - a "Link health" card with the delivery ratio.
+const int firmwareVersion = 13;
 #define FIRMWARE_BUILD_TIME __DATE__ " " __TIME__
 
 // Display settings for 2.4" SSD1309 — same OLED hardware as Paula
@@ -192,7 +194,7 @@ constexpr size_t loraPacketSizes[] = {
   sizeof(SeedlingMonitorData), sizeof(CommaRecord), sizeof(VitalSignsRecord), sizeof(WeatherForecastUpdate),
   sizeof(GraveyardShiftUpdate), sizeof(RequestCommand), sizeof(DeviceIdentityRecord),
   sizeof(VitalSignsRecordV2), sizeof(VitalSignsRecordV3), sizeof(PowerProfileRecord), sizeof(DeviceCommandRecord),
-  sizeof(LinkAckRecord), sizeof(WeatherForecast8Update)
+  sizeof(LinkAckRecord), sizeof(WeatherForecast8Update), sizeof(LinkHealthRecord)
 };
 static_assert(LoRaPacketSizeCheck::allDistinct(loraPacketSizes, sizeof(loraPacketSizes) / sizeof(loraPacketSizes[0]), 0, 1),
               "two LoRa packet structs have the same size - receivers dispatch on size, so they would be confused");
@@ -550,6 +552,7 @@ static void noteCard(const char *rawName, size_t nameLen, const uint8_t *serial,
   if (kind && (!e->kind[0] || type != CARD_VITAL)) strncpy(e->kind, kind, sizeof(e->kind) - 1);
   e->lastEpoch = card.epoch;
   e->rssi = rssi;
+  if (ok && type >= CARD_DAFFODIL && type <= CARD_SEEDLING) e->dataHeard++;  // link health: delivery ratio
   e->snr = snr;
   if (ok) {
     if (e->okCount++ == 0) e->histLen = e->histHead = 0;  // just became real: drop the junk cards
@@ -671,6 +674,39 @@ void notePowerProfilePacket(const PowerProfileRecord &r, bool ok, int rssi, floa
   noteCard(nullptr, 0, r.serialnumberarray, nullptr, CARD_POWER, ok, rssi, snr, v, 1);
 }
 
+// LinkHealthRecord (2026-11-10, "LoRa Link-Health Diagnosis" doc): what the device knows about its own
+// link. Annabelle adds the one thing only she knows - how many of its data packets arrived: delivery =
+// data packets heard here / the device's dataSent, between this record and its previous one.
+void noteLinkHealthPacket(const LinkHealthRecord &r, bool ok, int rssi, float snr) {
+  float delivery = NAN;
+  if (ok) {
+    char name[17];
+    cleanName(nullptr, 0, name);
+    portENTER_CRITICAL(&heardMux);
+    HeardEntry *e = heardRow(name, r.serialnumberarray);
+    // dataSent lower than last time = the device rebooted (its counters restarted): no ratio this once
+    if (e->linkKnown && r.dataSent >= e->linkSentAt) {
+      uint16_t sent = (uint16_t)(r.dataSent - e->linkSentAt);
+      uint16_t heardHere = (uint16_t)(e->dataHeard - e->linkDataHeardAt);
+      if (sent > 0) delivery = 100.0f * heardHere / sent;
+    }
+    e->linkKnown = true;
+    e->linkSentAt = r.dataSent;
+    e->linkDataHeardAt = e->dataHeard;
+    portEXIT_CRITICAL(&heardMux);
+  }
+  float v[] = { delivery, (float)r.dataSent, (float)r.dataScheduled, (float)r.busyAbandoned, (float)r.slotsMissed,
+                r.noiseMedian == LINK_HEALTH_NO_NOISE ? NAN : (float)r.noiseMedian,
+                r.gatewayAgeSec == LINK_HEALTH_UNKNOWN_AGE ? NAN : (float)r.gatewayRssi,
+                r.gatewayAgeSec == LINK_HEALTH_UNKNOWN_AGE ? NAN : r.gatewaySnrQ / 4.0f,
+                (float)r.rxCrcErrors };
+  static_assert(sizeof(v) / sizeof(v[0]) <= CARD_VALUES, "more values than a HeardCard holds");
+  noteCard(nullptr, 0, r.serialnumberarray, nullptr, CARD_LINK, ok, rssi, snr, v, 9);
+  if (debug) Serial.printf("LinkHealth #%u sent=%u/%u busy=%u failed=%u missed=%u noise=%d gw=%d delivery=%.0f%% (%s)\n",
+                           r.seq, r.dataSent, r.dataScheduled, r.busyAbandoned, r.txFailed, r.slotsMissed, r.noiseMedian,
+                           r.gatewayRssi, delivery, ok ? "ok" : "BAD");
+}
+
 static void cardJson(JsonObject o, const HeardCard &c) {
   o["t"] = c.epoch;
   o["ty"] = c.type;
@@ -740,21 +776,22 @@ static HeardCard historyCopy[HEARD_HISTORY];
 // Sensors/Power/Radio tabs - the front card alone is usually the vital signs a device sends 1 s
 // after its data, which hid the data. One row at a time under the lock, so only two cards of static
 // memory instead of two per row in heardSummaries.
-static HeardCard latestData, latestVital;
+static HeardCard latestData, latestVital, latestLink;
 static int8_t latestFunction;
 static float latestSensors[DAFFODIL_SENSORS];
-static void copyLatestCards(int row, uint16_t gen, bool &hasData, bool &hasVital) {
-  hasData = hasVital = false;
+static void copyLatestCards(int row, uint16_t gen, bool &hasData, bool &hasVital, bool &hasLink) {
+  hasData = hasVital = hasLink = false;
   latestFunction = 0;
   portENTER_CRITICAL(&heardMux);
   const HeardEntry &e = heard[row];
   if (e.gen == gen) {
     latestFunction = e.function;
     memcpy(latestSensors, e.sensors, sizeof(latestSensors));
-    for (int i = 0; i < e.histLen && !(hasData && hasVital); i++) {
+    for (int i = 0; i < e.histLen && !(hasData && hasVital && hasLink); i++) {
       const HeardCard &c = e.history[(e.histHead + HEARD_HISTORY - 1 - i) % HEARD_HISTORY];
       if (!hasData && c.type >= CARD_DAFFODIL && c.type <= CARD_SEEDLING) { latestData = c; hasData = true; }
       if (!hasVital && c.type == CARD_VITAL) { latestVital = c; hasVital = true; }
+      if (!hasLink && c.type == CARD_LINK) { latestLink = c; hasLink = true; }
     }
   }
   portEXIT_CRITICAL(&heardMux);
@@ -908,10 +945,11 @@ void fillTelepathonsJson(JsonDocument &json) {
     if (s.histLen && s.okCount > 0) {
       cardJson(r["front"].to<JsonObject>(), s.front);
       // The newest data and vital signs cards when the front isn't already that card.
-      bool hasData, hasVital;
-      copyLatestCards(i, s.gen, hasData, hasVital);
+      bool hasData, hasVital, hasLink;
+      copyLatestCards(i, s.gen, hasData, hasVital, hasLink);
       if (hasData && latestData.type != s.front.type) cardJson(r["data"].to<JsonObject>(), latestData);
       if (hasVital && s.front.type != CARD_VITAL) cardJson(r["vital"].to<JsonObject>(), latestVital);
+      if (hasLink && s.front.type != CARD_LINK) cardJson(r["link"].to<JsonObject>(), latestLink);
       // Daffodil function and its sensor readings (daffodilSensors), NAN -> null
       if (latestFunction) {
         r["fn"] = latestFunction;
@@ -1835,6 +1873,11 @@ void processLora(int packetSize) {
     LinkAckRecord ack;
     rxPacketRead((uint8_t*)&ack, sizeof(LinkAckRecord));
     if (debug) Serial.printf("ping answer from %.16s (%s)\n", ack.devicename, linkAckValid(ack) ? "ok" : "BAD");
+  } else if (packetSize == sizeof(LinkHealthRecord)) {
+    // A device's report on its own link, sent after its vital signs - see noteLinkHealthPacket.
+    LinkHealthRecord linkHealthRecord;
+    rxPacketRead((uint8_t*)&linkHealthRecord, sizeof(LinkHealthRecord));
+    noteLinkHealthPacket(linkHealthRecord, linkHealthValid(linkHealthRecord), rxPacketRssi(), rxPacketSnr());
   }
 }
 

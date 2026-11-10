@@ -6,14 +6,14 @@
 // because the IDE inserts its auto-prototypes above the first function in the sketch - a struct
 // defined in the .ino after that point is unknown to the prototypes that use it.
 #define MAX_HEARD 24
-#define HEARD_HISTORY 16   // cards kept per row, newest replaces oldest
+#define HEARD_HISTORY 15   // cards kept per row, newest replaces oldest (16 until 2026-11-10: static RAM was full)
 #define DAFFODIL_SENSORS 7   // board temperature, outdoor temperature and humidity + up to 4 function readings
 #define CARD_VALUES 9   // Daffodil and VitalSigns cards send 9 - noteSync() reads v[8], the Daffodil clock offset
 
 // Packet types on a card - telepathons.js has the matching labels (CARD_TYPES).
 enum HeardCardType : uint8_t {
   CARD_DAFFODIL = 1, CARD_CHINAMPA, CARD_LANGLEY, CARD_GLORIA, CARD_SEEDLING,
-  CARD_VITAL, CARD_IDENTITY, CARD_COMMA, CARD_POWER
+  CARD_VITAL, CARD_IDENTITY, CARD_COMMA, CARD_POWER, CARD_LINK  // CARD_LINK: LinkHealthRecord (2026-11-10)
 };
 
 // One received packet: when, how it was heard, whether it checked out, and up to CARD_VALUES
@@ -56,6 +56,13 @@ struct HeardEntry {
   // here, not on the cards, so the 16 cards per row stay 9 values each.
   int8_t function;
   float sensors[DAFFODIL_SENSORS];
+  // Link health (2026-11-10): data packets heard from this device, and that count and the device's
+  // own dataSent at its previous LinkHealthRecord - the delivery ratio is heard / sent between two.
+  // 16-bit like the device's counters (unsigned differences survive wrap-around).
+  uint16_t dataHeard;
+  uint16_t linkDataHeardAt;
+  uint16_t linkSentAt;
+  bool linkKnown;
   uint8_t histHead;      // next slot to write in history
   uint8_t histLen;
   HeardCard history[HEARD_HISTORY];
