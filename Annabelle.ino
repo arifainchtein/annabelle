@@ -55,7 +55,10 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 //      2026-11-11: own "www" partition for the website (partitions.csv) - releases now ship it.
 //      2026-11-11: each card says who resent the packet - the name in its sentbyarray ("via Chinamp"
 //      on the page); nothing when sentbyarray is empty, i.e. the device sent it itself.
-const int firmwareVersion = 13;
+// 14 = 2026-11-12: the 5-day forecast (40 OpenWeather slots) goes to the Pi over serial after each download
+//      (pushForecastToSerial -> the "Weather Forecast" dene of the telepathon "Annabelle"), and OpenWeather is
+//      asked at most once an hour (WEATHER_DOWNLOAD_INTERVAL_MS) - the 5-minute broadcast sends the stored one.
+const int firmwareVersion = 14;
 #define FIRMWARE_BUILD_TIME __DATE__ " " __TIME__
 
 // Display settings for 2.4" SSD1309 — same OLED hardware as Paula
@@ -419,7 +422,16 @@ DeviceCommandQueue deviceCommandQueue;
 // Outcome of the last WeatherForecastUpdate broadcast (5-minute timer, the Pi's getWF, or the
 // page's Send Now) - the weather line under the header of data/index.html. Written by
 // sendWeatherForecast() in loop(), read by the /Telepathons request, both under webMux.
-enum WeatherDownload : uint8_t { WEATHER_DL_OK = 1, WEATHER_DL_FAILED, WEATHER_DL_NO_INTERNET };
+// WEATHER_DL_CACHED (firmware 14): no download this time - the last one is under WEATHER_DOWNLOAD_INTERVAL_MS
+// old, so its forecast went out again. Anything other than 2 and 3 reads as "no download problem".
+enum WeatherDownload : uint8_t { WEATHER_DL_OK = 1, WEATHER_DL_FAILED, WEATHER_DL_NO_INTERNET, WEATHER_DL_CACHED };
+// Download from OpenWeather at most once an hour (2026-11-12): its 3-hour forecast doesn't change faster, and
+// one DigitalStables key serves every customer's gateway (~720 calls a month each instead of ~8,640 at one
+// per 5-minute broadcast). The 5-minute broadcast, the Pi's getWF and Send Now still go out every time,
+// with the stored forecast. A failed download is tried again at the next broadcast.
+#define WEATHER_DOWNLOAD_INTERVAL_MS 3600000UL
+// Slots of the long forecast for the Pi (40 = OpenWeather's 5 days of 3-hour slots); on the heap
+#define WEATHER_FORECAST_PI_SLOTS 40
 #define WEATHER_NO_FORECAST -1  // WeatherSendStatus.lora: there was nothing to send
 struct WeatherSendStatus {
   uint32_t epoch;     // Annabelle RTC, 0 = nothing sent since the reset
@@ -1044,8 +1056,9 @@ void fillTelepathonsJson(JsonDocument &json) {
 #define ANNABELLE_STATUS_HEARTBEAT_MS 600000UL
 // In RTC memory, not DRAM: v9 left 0 bytes of static DRAM (v10 with these in DRAM overflowed by 8).
 // RTC_NOINIT keeps its value across a reset, so setup() clears it: every boot starts with "not sent".
+// forecast (firmware 14): the WeatherForecastExtended "downloads" count last sent to the Pi
 struct AnnabelleStatusState {
-  uint32_t sent, rx, weather, ms;
+  uint32_t sent, rx, weather, ms, forecast;
 };
 RTC_NOINIT_ATTR AnnabelleStatusState annabelleStatus;
 
@@ -1102,6 +1115,51 @@ static int pushAnnabelleStatusToSerial(Stream &out) {
   annabelleStatus.rx = radioStats.rxPackets;
   annabelleStatus.weather = w.epoch;
   annabelleStatus.ms = upMs;
+  return 1;
+}
+
+// ---- The long forecast for the Pi (2026-11-12, firmware 14) ----
+// After each download, one line in the AsyncData reply with every slot of the 5-day forecast (up to 40
+// OpenWeather 3-hour slots, WeatherForecastExtended in the library). The Pi puts it in the "Weather
+// Forecast" dene of the telepathon "Annabelle" (WeatherForecastDeserializer in the Teleonome framework), so
+// the Teleonome and devices.digitalstables.com show the forecast the field devices were sent - nobody
+// else downloads one. It goes after the status line in the same reply, so the telepathon is already there.
+// Wire format, '#' separated, ~1.3 KB for 40 slots:
+//   WeatherForecastDeserializer#1#serialnumber#ageSec#timezoneOffsetSec#count#slot#slot#...
+//   slot = dt,temperature,humidity,cloudiness,pressure,rain,pop,wind,code
+//   (dt UTC epoch; C, %, %, hPa, mm in 3 h, % chance of rain, m/s, OpenWeather condition id)
+// ageSec: seconds since the download, so Annabelle's clock (not UTC) never comes into it.
+// A framework without the deserializer ignores the line (no deserializer matches it).
+static bool forecastToPiDue() {
+  if (serialNumber.length() == 0 || weatherForecastManager == nullptr) return false;
+  const WeatherForecastExtended *e = weatherForecastManager->getExtendedForecast();
+  return e != nullptr && e->count > 0 && e->downloads != annabelleStatus.forecast;
+}
+
+// Returns 1 when a line was sent, 0 otherwise (counted in AsyncData's reply like the other stores).
+static int pushForecastToSerial(Stream &out) {
+  if (!forecastToPiDue()) return 0;
+  const WeatherForecastExtended *e = weatherForecastManager->getExtendedForecast();
+  out.print("WeatherForecastDeserializer#1#");
+  out.print(serialNumber); out.print('#');
+  out.print((millis() - weatherForecastManager->getLastDownloadMs()) / 1000); out.print('#');
+  out.print(e->timezoneOffset); out.print('#');
+  out.print(e->count);
+  for (int i = 0; i < e->count; i++) {
+    const WeatherForecastExtSlot &s = e->slots[i];
+    out.print('#');
+    out.print(s.secondsTime); out.print(',');
+    out.print(s.temperature, 1); out.print(',');
+    out.print(s.humidity); out.print(',');
+    out.print(s.cloudiness); out.print(',');
+    out.print(s.pressure); out.print(',');
+    out.print(s.rain, 2); out.print(',');
+    out.print(s.pop); out.print(',');
+    out.print(s.wind, 1); out.print(',');
+    out.print(s.code);
+  }
+  out.println();
+  annabelleStatus.forecast = e->downloads;
   return 1;
 }
 
@@ -1578,7 +1636,11 @@ void sendWeatherForecast(int internetRechecks, const char *trigger) {
   if (debug) Serial.println("About to get and send weatherforecasts");
   // WiFi down (router out, 2026-10-17): no pings or downloads - each one waits for its timeouts
   // inside loop(), which stalled loop() for minutes at a time overnight.
-  bool wifiUp = WiFi.status() == WL_CONNECTED;
+  // No download due (the last one is under WEATHER_DOWNLOAD_INTERVAL_MS old): no internet check either.
+  unsigned long lastDownload = weatherForecastManager->getLastDownloadMs();
+  bool downloadDue = lastDownload == 0 || millis() - lastDownload >= WEATHER_DOWNLOAD_INTERVAL_MS
+                     || !weatherForecastManager->hasValidForecasts();
+  bool wifiUp = downloadDue && WiFi.status() == WL_CONNECTED;
   bool wifiAvail = wifiUp && wifiManager.getInternetAvailable();
   for (int i = 0; wifiUp && i < internetRechecks && !wifiAvail; i++) {
     wifiManager.checkInternetConnectionAvailable();
@@ -1586,7 +1648,10 @@ void sendWeatherForecast(int internetRechecks, const char *trigger) {
   }
   WeatherSendStatus s = {};
   strlcpy(s.trigger, trigger, sizeof(s.trigger));
-  if (wifiAvail) {
+  if (!downloadDue) {
+    s.download = WEATHER_DL_CACHED;
+    if (debug) Serial.println("Weather forecast under an hour old, sending the stored one");
+  } else if (wifiAvail) {
     LOOP_STAGE(STAGE_WEATHER_DOWNLOAD);
     bool success = weatherForecastManager->downloadWeatherData();
     LOOP_STAGE(STAGE_WEATHER_TX);
@@ -3136,6 +3201,9 @@ void setup() {
   weatherForecastManager = new WeatherForecastManager(Serial, latitude, longitude, apiKey.c_str());
   weatherForecastManager->initialize(currentTimerRecord);
   weatherForecastManager->loadForecasts(Serial);
+  // the 5-day forecast for the Pi (firmware 14): ~1.9 KB on the heap, two copies of 40 slots
+  if (!weatherForecastManager->enableExtendedForecast(WEATHER_FORECAST_PI_SLOTS) && debug)
+    Serial.println(F("No heap for the 5-day forecast - the Pi gets none, LoRa as before"));
 
   pinMode(RTC_BATT_VOLT, INPUT);
   pinMode(OP_MODE, INPUT_PULLUP);
@@ -3694,8 +3762,9 @@ void loop() {
       // Non-destructive peek so the Pi knows how many lines to read before it
       // actually asks for the data with AsyncData.
       // + 1 when Annabelle's own status line will go too (pushAnnabelleStatusToSerial, 2026-11-01)
+      // + 1 when the 5-day forecast line will go too (pushForecastToSerial, firmware 14)
       Serial.println(dataManager.getPendingQueueItemCount() + vitalSignsStore.pendingCount() + deviceIdentityStore.pendingCount() + powerProfileStore.pendingCount()
-                     + (annabelleStatusDue() ? 1 : 0));
+                     + (annabelleStatusDue() ? 1 : 0) + (forecastToPiDue() ? 1 : 0));
       //
       // Per-type available/dropped/flash-health breakdown, added 2026-08-04
       // for capacity planning as device counts grow (many Daffodils, several
@@ -3816,6 +3885,8 @@ void loop() {
       int identityDownloaded = deviceIdentityStore.pushPendingToSerial(Serial);
       int powerDownloaded = powerProfileStore.pushPendingToSerial(Serial);
       int statusDownloaded = pushAnnabelleStatusToSerial(Serial);
+      // after the status line, so the Pi already has the telepathon "Annabelle" to put it in
+      int forecastDownloaded = pushForecastToSerial(Serial);
 
       Serial.print("Ok-AsyncData#");
       Serial.print("DS="); Serial.print(dsDownloaded);
@@ -3828,6 +3899,7 @@ void loop() {
       Serial.print("|Identity="); Serial.print(identityDownloaded);
       Serial.print("|Power="); Serial.print(powerDownloaded);
       Serial.print("|Annabelle="); Serial.print(statusDownloaded);
+      Serial.print("|Forecast="); Serial.print(forecastDownloaded);
       //
       // Reset diagnostics ride on the AsyncData terminator so the Hypothalamus
       // records them every Async Cycle (generic to any microcontroller):
