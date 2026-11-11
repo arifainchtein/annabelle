@@ -17,6 +17,8 @@
 #include <AnnabelleData.h>
 #include <AnnabelleWifiManager.h>
 #include <DataManager.h>
+#include <SentBy.h>  // sentby / routes tokens on the lines to the Pi (2026-11-11)
+#include "RouteEntry.h"
 #include <PCF8563TimeManager.h>
 #include <Esp32SecretManager.h>
 #include "OneWire.h"
@@ -46,6 +48,8 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 // Add 1 to firmwareVersion with every flashed change; the build time tells two builds of one version apart.
 // 12 = 2026-11-03: answers Paula's signal-survey ping (handlePing, LinkAckRecord).
 // 13 = 2026-11-10: reads LinkHealthRecord (link diagnosis) - a "Link health" card with the delivery ratio.
+//      2026-11-11: routes - every copy of a reading (direct, via each relay) is collected for 4 s and the
+//      reading goes to the Pi once with "routes:direct,Lan1" (Purpose dene "Routes" / "Route Count").
 //      2026-11-11: LangleyData has a sentbyarray (164 bytes, was 156 - the Langley needs reflashing) -
 //      a relayed Langley shows "via ...".
 //      2026-11-11: own "www" partition for the website (partitions.csv) - releases now ship it.
@@ -1693,6 +1697,144 @@ void sendPendingLinkAck() {
   sendMessage(pingState->ack);
 }
 
+// ---- Routes (2026-11-11) ----
+// With relays (Langley "Lan1", Paula, Chinampa), one reading can reach Annabelle several times: direct
+// and once per relay. The Pi keeps only the first copy (storeTelepathon skips a repeat name + time),
+// so the count is made here: the first good copy of a DigitalStablesData / ChinampaData / LangleyData
+// waits ROUTE_WINDOW_MS while later copies of the same reading (same serial and secondsTime) add their
+// route; then it is queued for the Pi once. The serializers add "routes:direct,Lan1" (SentBy.h,
+// routesLookup below); the Pi puts it in the Purpose dene as "Routes" and "Route Count".
+// The window covers a relay's 150-650 ms wait, up to ~1 s of busy-channel waits and the ~1.2 s a
+// Chinampa packet is on the air. Readings are remembered for ROUTE_DONE more readings after that, for
+// the serializer (the Pi asks every few seconds) and for a copy arriving after the window.
+// On the heap (calloc in setup, routeBegin): static RAM is full - these didn't fit (2026-11-11).
+RoutePending *routePending = nullptr;
+RouteDone *routeDone = nullptr;
+uint8_t routeDoneNext = 0;
+uint32_t routeCopies = 0;  // copies after the first, all devices, since boot
+
+// "direct" for an empty sentbyarray, else its printable characters
+static void routeNameOf(const uint8_t *sentby, char *out) {
+  int n = 0;
+  for (int i = 0; i < 8 && sentby[i]; i++)
+    if (sentby[i] > 32 && sentby[i] < 127 && sentby[i] != '#' && sentby[i] != ',') out[n++] = (char)sentby[i];
+  out[n] = 0;
+  if (!n) strcpy(out, "direct");
+}
+
+// adds name to a comma list unless it is there already
+static void routeAdd(char *list, const char *name) {
+  size_t nl = strlen(name);
+  for (const char *p = list; *p;) {
+    const char *e = strchr(p, ',');
+    size_t len = e ? (size_t)(e - p) : strlen(p);
+    if (len == nl && strncmp(p, name, nl) == 0) return;
+    if (!e) break;
+    p = e + 1;
+  }
+  size_t used = strlen(list);
+  if (used + (used ? 1 : 0) + nl >= ROUTE_LIST) return;
+  if (used) list[used++] = ',';
+  strcpy(list + used, name);
+}
+
+// queues a pending reading for the Pi and remembers its routes
+static void routeFlush(RoutePending &p) {
+  if (p.kind == ROUTE_KIND_DSD) {
+    DigitalStablesData d;
+    memcpy(&d, p.bytes, sizeof(d));
+    dataManager.storeDigitalStablesData(d);
+    digitalStablesDataNewData = true;
+  } else if (p.kind == ROUTE_KIND_CHINAMPA) {
+    ChinampaData d;
+    memcpy(&d, p.bytes, sizeof(d));
+    dataManager.storeChinampaData(d);
+    chinampaDataNewData = true;
+  } else if (p.kind == ROUTE_KIND_LANGLEY) {
+    LangleyData d;
+    memcpy(&d, p.bytes, sizeof(d));
+    dataManager.storeLangleyData(d);
+    langleyDataNewData = true;
+  }
+  RouteDone &done = routeDone[routeDoneNext];
+  routeDoneNext = (routeDoneNext + 1) % ROUTE_DONE;
+  memcpy(done.serial, p.serial, 8);
+  done.secondsTime = p.secondsTime;
+  strcpy(done.routes, p.routes);
+  p.kind = 0;
+}
+
+// A good data packet, instead of storing it straight away: the first copy of a reading waits, later
+// copies only add their route.
+static void routeNote(uint8_t kind, const uint8_t *serial, long secondsTime, const uint8_t *sentby,
+                      const void *data, size_t size) {
+  if (!routePending || !routeDone) {  // allocation failed: store straight away, as before routes
+    if (kind == ROUTE_KIND_DSD) { dataManager.storeDigitalStablesData(*(DigitalStablesData *)data); digitalStablesDataNewData = true; }
+    else if (kind == ROUTE_KIND_CHINAMPA) { dataManager.storeChinampaData(*(ChinampaData *)data); chinampaDataNewData = true; }
+    else if (kind == ROUTE_KIND_LANGLEY) { dataManager.storeLangleyData(*(LangleyData *)data); langleyDataNewData = true; }
+    return;
+  }
+  char name[9];
+  routeNameOf(sentby, name);
+  for (int i = 0; i < ROUTE_PENDING; i++) {
+    RoutePending &p = routePending[i];
+    if (p.kind == kind && p.secondsTime == secondsTime && memcmp(p.serial, serial, 8) == 0) {
+      routeAdd(p.routes, name);
+      routeCopies++;
+      return;
+    }
+  }
+  for (int i = 0; i < ROUTE_DONE; i++) {  // a copy arriving after its window - its route still counts
+    RouteDone &d = routeDone[i];
+    if (d.secondsTime == secondsTime && memcmp(d.serial, serial, 8) == 0) {
+      routeAdd(d.routes, name);
+      routeCopies++;
+      return;
+    }
+  }
+  int slot = -1;
+  for (int i = 0; i < ROUTE_PENDING; i++) {
+    if (!routePending[i].kind) { slot = i; break; }
+    if (slot < 0 || routePending[i].firstMs < routePending[slot].firstMs) slot = i;  // oldest if all busy
+  }
+  RoutePending &p = routePending[slot];
+  if (p.kind) routeFlush(p);  // all busy: the oldest goes now
+  p.kind = kind;
+  p.firstMs = millis();
+  memcpy(p.serial, serial, 8);
+  p.secondsTime = secondsTime;
+  p.routes[0] = 0;
+  routeAdd(p.routes, name);
+  memcpy(p.bytes, data, size);
+}
+
+static void routeBegin() {
+  routePending = (RoutePending *)calloc(ROUTE_PENDING, sizeof(RoutePending));
+  routeDone = (RouteDone *)calloc(ROUTE_DONE, sizeof(RouteDone));
+}
+
+// From loop(): readings whose window has passed go to the Pi's queue.
+static void routeService() {
+  if (!routePending) return;
+  uint32_t now = millis();
+  for (int i = 0; i < ROUTE_PENDING; i++)
+    if (routePending[i].kind && now - routePending[i].firstMs >= ROUTE_WINDOW_MS) routeFlush(routePending[i]);
+}
+
+// SentBy.h's lookup, for the serializers
+static bool routesLookup(const uint8_t *serial, long secondsTime, char *out, size_t n) {
+  if (!routeDone) return false;
+  for (int i = 0; i < ROUTE_DONE; i++) {
+    const RouteDone &d = routeDone[i];
+    if (d.secondsTime == secondsTime && memcmp(d.serial, serial, 8) == 0) {
+      strncpy(out, d.routes, n - 1);
+      out[n - 1] = 0;
+      return true;
+    }
+  }
+  return false;
+}
+
 void processLora(int packetSize) {
   if (debug) Serial.println("Received lora size=" + String(packetSize));
   if (packetSize == 0) return;  // if there's no packet, return
@@ -1721,8 +1863,9 @@ void processLora(int packetSize) {
     // while rejecting whole packets whose bytes don't match what was actually transmitted -
     // see conversation 2026-07-20.
     if (checksumOk) {
-      dataManager.storeLangleyData(langleyData);
-      langleyDataNewData = true;
+      // queued for the Pi after ROUTE_WINDOW_MS, with every route that delivered it (routeNote)
+      routeNote(ROUTE_KIND_LANGLEY, langleyData.serialnumberarray, langleyData.secondsTime, langleyData.sentbyarray,
+                &langleyData, sizeof(langleyData));
       // Weather reply and WiFi commands, as for a Daffodil (Langley.ino since 2026-10-23)
       queueWeatherReply(langleyData.serialnumberarray, langleyData.devicename,
                         (long)langleyData.sleepTime, (int)langleyData.opMode);
@@ -1758,8 +1901,9 @@ void processLora(int packetSize) {
     digitalStablesData.rssi = rxPacketRssi();
     digitalStablesData.snr = rxPacketSnr();
     if (checksumOk) {
-      dataManager.storeDigitalStablesData(digitalStablesData);
-      digitalStablesDataNewData = true;
+      // queued for the Pi after ROUTE_WINDOW_MS, with every route that delivered it (routeNote)
+      routeNote(ROUTE_KIND_DSD, digitalStablesData.serialnumberarray, digitalStablesData.secondsTime,
+                digitalStablesData.sentbyarray, &digitalStablesData, sizeof(digitalStablesData));
       queueWeatherReply(digitalStablesData.serialnumberarray, digitalStablesData.devicename,
                         digitalStablesData.sleepTime, digitalStablesData.opMode);
       portENTER_CRITICAL(&heardMux);
@@ -1792,8 +1936,9 @@ void processLora(int packetSize) {
     // of this size had unreadable names.
     bool ok = nameLooksReal(chinampaData.devicename, sizeof(chinampaData.devicename));
     if (ok) {
-      dataManager.storeChinampaData(chinampaData);
-      chinampaDataNewData = true;
+      // queued for the Pi after ROUTE_WINDOW_MS, with every route that delivered it (routeNote)
+      routeNote(ROUTE_KIND_CHINAMPA, chinampaData.serialnumberarray, chinampaData.secondsTime, chinampaData.sentbyarray,
+                &chinampaData, sizeof(chinampaData));
     }
     noteChinampaPacket(chinampaData, ok);
     if (debug) Serial.print("received chinampaData from ");
@@ -3059,6 +3204,8 @@ void setup() {
   } else {
     if (debug) Serial.println("www partition empty or missing - web page from LittleFS");
   }
+  routeBegin();
+  routesLookupHook() = routesLookup;  // the serializers' "routes:" token (SentBy.h)
   wifiManager.start();
   bool stationmode = wifiManager.getStationMode();
   wifiStationWanted = stationmode && wifiManager.getSSID() != "";
@@ -3232,6 +3379,7 @@ void fillRadioHistoryJson(JsonDocument &json) {
 void loop() {
   int hour, minute, second;
   loopAliveMs = millis();
+  routeService();  // readings whose route window has passed go to the Pi's queue (2026-11-11)
   {
     static uint32_t lastLoopMs = 0;
     uint32_t nowMs = millis();
