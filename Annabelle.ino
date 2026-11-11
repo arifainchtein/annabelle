@@ -46,6 +46,8 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 // Add 1 to firmwareVersion with every flashed change; the build time tells two builds of one version apart.
 // 12 = 2026-11-03: answers Paula's signal-survey ping (handlePing, LinkAckRecord).
 // 13 = 2026-11-10: reads LinkHealthRecord (link diagnosis) - a "Link health" card with the delivery ratio.
+//      2026-11-11: LangleyData has a sentbyarray (164 bytes, was 156 - the Langley needs reflashing) -
+//      a relayed Langley shows "via ...".
 //      2026-11-11: own "www" partition for the website (partitions.csv) - releases now ship it.
 //      2026-11-11: each card says who resent the packet - the name in its sentbyarray ("via Chinamp"
 //      on the page); nothing when sentbyarray is empty, i.e. the device sent it itself.
@@ -666,6 +668,7 @@ void noteLangleyPacket(const LangleyData &d, bool ok) {
   float v[] = { d.batteryVoltage, d.batteryCurrentMa, d.solarVoltage, d.solarCurrentMa, d.fenceVoltageAvg,
                 d.energizerBatteryVoltage, d.temperature, clockOffset(d.secondsTime), d.sleepTime };
   static_assert(sizeof(v) / sizeof(v[0]) <= CARD_VALUES, "more values than a HeardCard holds");
+  nextCardVia = viaFromSentBy(d.sentbyarray);
   noteCard(d.devicename, sizeof(d.devicename), d.serialnumberarray, "Langley", CARD_LANGLEY, ok, (int)d.rssi, d.snr, v, 9);
   // sleepTime/wifiStatus/opMode since 2026-10-23 - older Langleys send 1800/3.75/3.25 there until reflashed
   if (ok) noteSyncAndWifi(d.devicename, sizeof(d.devicename), d.serialnumberarray, (int)d.opMode, v[7], (uint8_t)d.wifiStatus);

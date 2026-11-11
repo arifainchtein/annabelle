@@ -189,9 +189,9 @@ function ageColor(sec, card) {
 }
 
 // How a packet arrived (2026-11-11) - card.via is the name in its sentbyarray ("Chinamp", "Paula"...);
-// absent = sentbyarray was empty, the device sent it itself. Only data packets (Daffodil, Chinampa)
-// carry a sentby, so only they say "direct".
-function hasSentBy(card) { return card && (card.ty === 1 || card.ty === 2); }
+// absent = sentbyarray was empty, the device sent it itself. Only data packets (Daffodil, Chinampa,
+// Langley) carry a sentby, so only they say "direct".
+function hasSentBy(card) { return card && (card.ty === 1 || card.ty === 2 || card.ty === 3); }  // Langley too since 2026-11-11
 function viaText(card) {
     if (!hasSentBy(card)) return "";
     return card.via ? ' · <span class="tp-via">via ' + esc(card.via) + "</span>" : ' · <span class="tp-direct">direct</span>';
