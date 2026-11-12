@@ -29,6 +29,10 @@ function refreshHeader() {
     $("chip-lora").style.color = webData.lora ? "#0d6efd" : "#c62828";
     $("chip-net").style.color = webData.internetAvailable ? "#2e7d32" : "#c62828";
     $("chip-ssid").textContent = webData.stationmode ? (webData.ssid || "") : "Access point " + (webData.soft_ap_ssid || "");
+    // the firmware that is running, in the header (2026-11-12): "Firmware 14", the build time on hover
+    var fw = /Version\s+(\d+)\s*(?:\((.*)\))?/.exec(webData.firmware || "");
+    $("chip-firmware").textContent = fw ? "Firmware " + fw[1] : (webData.firmware || "");
+    $("chip-firmware").title = fw && fw[2] ? "Built " + fw[2] : "";
 }
 
 // ---------------------------------------------------------------- System Info / Set Time / GPS

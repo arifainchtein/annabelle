@@ -58,7 +58,9 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 // 14 = 2026-11-12: the 5-day forecast (40 OpenWeather slots) goes to the Pi over serial after each download
 //      (pushForecastToSerial -> the "Weather Forecast" dene of the telepathon "Annabelle"), and OpenWeather is
 //      asked at most once an hour (WEATHER_DOWNLOAD_INTERVAL_MS) - the 5-minute broadcast sends the stored one.
-const int firmwareVersion = 14;
+// 15 = 2026-11-12: LangleyData carries the Langley's battery temperature (Valentino's thermistor): 168 bytes, was
+//      164 - Langley and Annabelle are flashed together; the line to the Pi gets a "battemp:" token.
+const int firmwareVersion = 15;
 #define FIRMWARE_BUILD_TIME __DATE__ " " __TIME__
 
 // Display settings for 2.4" SSD1309 — same OLED hardware as Paula
