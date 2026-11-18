@@ -60,7 +60,11 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 //      asked at most once an hour (WEATHER_DOWNLOAD_INTERVAL_MS) - the 5-minute broadcast sends the stored one.
 // 15 = 2026-11-12: LangleyData carries the Langley's battery temperature (Valentino's thermistor): 168 bytes, was
 //      164 - Langley and Annabelle are flashed together; the line to the Pi gets a "battemp:" token.
-const int firmwareVersion = 15;
+// 16 = 2026-11-16/17 (DigitalStablesDataSerializer, library): the Daffodil line to the Pi gets tokens 57/58
+//      (Level Setup full / low alarm depth) and 59 (relayStatus - the devices "Relay" badge), before
+//      sentby/routes; latitude/longitude go with 6 decimals (were 2: Pool showed ~1 km off on devices) -
+//      also in the Gloria, Seedling and Pancho serializers.
+const int firmwareVersion = 16;
 #define FIRMWARE_BUILD_TIME __DATE__ " " __TIME__
 
 // Display settings for 2.4" SSD1309 — same OLED hardware as Paula
@@ -3683,7 +3687,11 @@ void loop() {
       timeManager.printTimeToSerial(currentTimerRecord);
       Serial.flush();
     } else if (command.startsWith("GetCommandCode")) {
-      long code = secretManager.generateCode();
+      // Real UTC epoch (2026-11-18), not generateCode()'s getTimeForCodeGeneration(), which counts
+      // Melbourne local time as UTC (11 h ahead in AEDT) - its codes never matched the user's
+      // authenticator. Same time base as VerifyUserCode below. The LoRa codes (generateCodeAt with
+      // annabelleTime / senderTime) are left on the local-as-UTC base the field devices use.
+      long code = secretManager.generateCode(timeManager.now().epoch);
       //
       // patch a bug in the totp library
       // if the first digit is a zero, it
@@ -3705,7 +3713,9 @@ void loop() {
     } else if (command.startsWith("VerifyUserCode")) {
       String codeInString = generalFunctions.getValue(command, '#', 1);
       long userCode = codeInString.toInt();
-      boolean validCode = true;  //secretManager.checkCode( userCode);
+      // Was hard-wired to true (every code accepted). Annabelle becomes the mother microcontroller
+      // (2026-11-18), so this is now the real check, against the real UTC epoch like GetCommandCode.
+      boolean validCode = secretManager.checkCode(userCode, timeManager.now().epoch);
       Serial.println(validCode ? "Ok-Valid Code" : "Failure-Invalid Code");
       Serial.flush();
     } else if (command.startsWith("GetSecret")) {
