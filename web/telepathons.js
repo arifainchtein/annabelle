@@ -32,10 +32,10 @@ var CARD_TYPES = {
 // the readings Annabelle.ino daffodilSensors() sends for it in "sens", after the board temperature and the
 // outdoor temperature/humidity (OUTDOOR, shown for any function that has the sensor).
 var OUTDOOR = [["Outdoor temperature", "°C", 1], ["Outdoor humidity", "%", 0]];
-var FLOW = ["Flow 1", "L/min", 1], TOTAL = ["Flow 1 total", mlText], TANK1 = ["Tank 1 pressure", "psi", 2], TROUGH = ["Trough level", "cm", 0];
+var FLOW = ["Flow 1", "L/min", 1], TOTAL = ["Flow 1 total", litresText], TANK1 = ["Tank 1 pressure", "psi", 2], TROUGH = ["Trough level", "cm", 0];
 var FUNCTIONS = {
     1: { name: "One flow meter", f: [FLOW, TOTAL] },
-    2: { name: "Two flow meters", f: [FLOW, TOTAL, ["Flow 2", "L/min", 1], ["Flow 2 total", mlText]] },
+    2: { name: "Two flow meters", f: [FLOW, TOTAL, ["Flow 2", "L/min", 1], ["Flow 2 total", litresText]] },
     3: { name: "Flow meter and tank", f: [FLOW, TOTAL, TANK1] },
     4: { name: "One tank", f: [TANK1] },
     5: { name: "Two tanks", f: [TANK1, ["Tank 2 pressure", "psi", 2]] },
@@ -49,11 +49,9 @@ var FUNCTIONS = {
     13: { name: "Water trough and water temperature", f: [TROUGH, ["Water temperature", "°C", 1]] },
     15: { name: "Water trough (echo/trigger ultrasonic)", f: [TROUGH, ["Trough minimum", "cm", 0], ["Trough maximum", "cm", 0]] }
 };
-// Flow totals as the Daffodil's own page shows them: ml up to 1 L, then litres.
-function mlText(v) {
-    if (v > 10000) return (v / 1000).toFixed(0) + " L";
-    if (v > 1000) return (v / 1000).toFixed(2) + " L";
-    return Math.round(v) + " ml";
+// Daffodil flow totals arrive in litres (totalLiters, 2026-11-19), shown as the Daffodil's own page does.
+function litresText(v) {
+    return (v >= 10 ? v.toFixed(0) : v.toFixed(2)) + " L";
 }
 
 // The Sensors tab's function block for a Daffodil (front of the stack only - older cards don't keep it).

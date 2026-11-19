@@ -638,13 +638,13 @@ static void noteSyncAndWifi(const char *rawName, size_t nameLen, const uint8_t *
 // the Daffodil reports -99, no sensor). NAN = unused slot. Same split as the Daffodil's own page (index.js refreshScreen).
 static void daffodilSensors(const DigitalStablesData &d, float out[DAFFODIL_SENSORS]) {
   for (int i = 0; i < DAFFODIL_SENSORS; i++) out[i] = NAN;
-  out[0] = (int8_t)d.temperature;  // DS18B20 on the board, whole degrees (negative wraps in the uint8_t)
+  out[0] = (int8_t)d.temperature;  // board temperature (DS18B20, or MCP9808 on Wally18+), whole degrees (negative wraps in the uint8_t)
   if (d.outdoortemperature != -99) { out[1] = d.outdoortemperature; out[2] = d.outdoorhumidity; }
   float *f = out + 3;
   switch (d.currentFunctionValue) {
-    case FUN_1_FLOW: f[0] = d.flowRate; f[1] = d.totalMilliLitres; break;
-    case FUN_2_FLOW: f[0] = d.flowRate; f[1] = d.totalMilliLitres; f[2] = d.flowRate2; f[3] = d.totalMilliLitres2; break;
-    case FUN_1_FLOW_1_TANK: f[0] = d.flowRate; f[1] = d.totalMilliLitres; f[2] = d.tank1PressurePsi; break;
+    case FUN_1_FLOW: f[0] = d.flowRate; f[1] = d.totalLiters; break;
+    case FUN_2_FLOW: f[0] = d.flowRate; f[1] = d.totalLiters; f[2] = d.flowRate2; f[3] = d.totalLiters2; break;
+    case FUN_1_FLOW_1_TANK: f[0] = d.flowRate; f[1] = d.totalLiters; f[2] = d.tank1PressurePsi; break;
     case FUN_1_TANK: f[0] = d.tank1PressurePsi; break;
     case FUN_2_TANK: f[0] = d.tank1PressurePsi; f[1] = d.tank2PressurePsi; break;
     case DAFFODIL_SCEPTIC_TANK: f[0] = d.measuredHeight; f[1] = d.maximumScepticHeight; break;
@@ -1194,7 +1194,9 @@ enum WebAction : uint8_t { WEB_NONE, WEB_SET_TIME, WEB_SET_TIME_INTERNET, WEB_SE
 volatile uint8_t webAction = WEB_NONE;
 char webArgA[32], webArgB[32];
 char webResult[96] = "";
-float boardTemperature = NAN;  // Annabelle's DS18B20, read once a minute in loop()
+float boardTemperature = NAN;  // Annabelle's board temperature (DS18B20, or MCP9808 on Wally18+), read once a minute in loop()
+#define MCP9808_ADDR 0x18  // Wally18+ board temperature (replaces the DS18B20 on GPIO27), A0-A2 to GND
+bool foundMCP9808 = false;  // Wally18+: read the MCP9808 over I2C, never drive OneWire on GPIO27
 #define CONFIG_PREFS "annabelleCfg"
 
 String queueWebAction(const String &form, const String &a, const String &b) {
@@ -3093,10 +3095,35 @@ void processWebAction() {
   portEXIT_CRITICAL(&webMux);
 }
 
-// Annabelle's DS18B20 (also its serial number) as the board temperature: a conversion is started at
-// second 15 and read at second 17, so loop() never waits the ~750 ms a blocking read takes.
+// MCP9808 (Wally18+ board temperature) - same register reads as Daffodil.ino / Paula2.
+bool mcp9808Present() {
+  Wire.beginTransmission(MCP9808_ADDR);
+  Wire.write(0x06);  // manufacturer ID register, reads 0x0054
+  if (Wire.endTransmission() != 0) return false;
+  if (Wire.requestFrom((uint8_t)MCP9808_ADDR, (uint8_t)2) != 2) return false;
+  uint16_t id = (Wire.read() << 8) | Wire.read();
+  return id == 0x0054;
+}
+
+float readMCP9808() {
+  Wire.beginTransmission(MCP9808_ADDR);
+  Wire.write(0x05);  // ambient temperature register
+  if (Wire.endTransmission() != 0) return NAN;
+  if (Wire.requestFrom((uint8_t)MCP9808_ADDR, (uint8_t)2) != 2) return NAN;
+  uint8_t upper = Wire.read() & 0x1F;
+  uint8_t lower = Wire.read();
+  float celsius = (upper & 0x0F) * 16.0f + lower / 16.0f;
+  if (upper & 0x10) celsius -= 256.0f;
+  return celsius;
+}
+
+// Annabelle's board temperature, once a minute. Wally18+: the MCP9808, read at second 17. Older
+// Wallys: the DS18B20 - a conversion is started at second 15 and read at second 17, so loop() never
+// waits the ~750 ms a blocking read takes.
 void tickBoardTemperature(uint8_t second) {
-  if (second == 15) {
+  if (foundMCP9808) {
+    if (second == 17) boardTemperature = readMCP9808();
+  } else if (second == 15) {
     tempSensor.setWaitForConversion(false);
     tempSensor.requestTemperatures();
   } else if (second == 17) {
@@ -3184,14 +3211,20 @@ void setup() {
   tzset();
 
   pinMode(RTC_CLK_OUT, INPUT_PULLUP);
-  tempSensor.begin();
-  uint8_t address[8];
-  if (tempSensor.getAddress(address, 0)) {
-    // 2026-10-30: the serial number is the efuse MAC, as the factory records it, not this sensor's ID
-    DeviceSerial::fill(annabelleData.serialnumberarray);
-    serialNumber = DeviceSerial::toString(annabelleData.serialnumberarray);
+  // 2026-10-30: the serial number is the efuse MAC, as the factory records it, not the DS18B20's ID.
+  // Set it whatever temperature sensor the board has - it used to be set only when the DS18B20 was
+  // found, so a Wally18+ (no DS18B20) came up with no serial number.
+  DeviceSerial::fill(annabelleData.serialnumberarray);
+  serialNumber = DeviceSerial::toString(annabelleData.serialnumberarray);
+  // Wally18+ has an MCP9808 at 0x18 instead of the DS18B20, and GPIO27 goes to the shield header:
+  // don't run OneWire on it there.
+  foundMCP9808 = mcp9808Present();
+  if (foundMCP9808) {
+    if (debug) Serial.println(F("Board temperature: MCP9808 (Wally18+)"));
   } else {
-    if (debug) Serial.println(F("Error fetching the temp sensor address"));
+    tempSensor.begin();
+    uint8_t address[8];
+    if (!tempSensor.getAddress(address, 0) && debug) Serial.println(F("Error fetching the temp sensor address"));
   }
 
   FastLED.addLeds<WS2812, LED_PIN, GRB>(leds, NUM_LEDS);
