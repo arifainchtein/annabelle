@@ -3411,6 +3411,49 @@ void wifiWatchdogTick() {
 // restart before it crashes. Reported as reason SW, stage "restart: low memory", and counted in
 // resetDiagLowMemRestarts (lowMemRestarts on /Telepathons).
 #define LOWMEM_RESTART_AFTER_SEC (10UL * 60UL)
+
+// ---------------------------------------------------------------- VerifyUserCode (2026-11-19)
+// The Teleonome page's commands (Stop Hypothalamus, Restart, the whitelist, saving a tab...) carry the 6-digit code.
+// The page remembers it for 14 minutes and a command waits for the Hypothalamus's next cycle, so the current 30 s
+// step alone (the check of 2026-11-18) refused good codes. As Cleotilde (2026-11-04): a code from any step in the last
+// 15 minutes is accepted, one step ahead too for clock skew; 5 wrong codes in an hour lock checking for an hour; a code
+// just accepted answers valid again for 15 s (the Pi resends after a garbled answer). LoRa codes are not affected.
+#define TOTP_STEP_SEC 30
+#define VERIFY_STEPS_BACK 30
+#define VERIFY_STEPS_AHEAD 1
+#define VERIFY_MAX_FAILURES 5
+#define VERIFY_LOCKOUT_SEC 3600UL
+#define VERIFY_REPEAT_SEC 15UL
+unsigned long verifyFailureSec[VERIFY_MAX_FAILURES];  // millis()/1000 of the last wrong codes, 0 = empty
+int verifyFailurePos = 0;
+long verifyLastAcceptedCode = -1;
+unsigned long verifyLastAcceptedSec = 0;
+
+bool verifyCodeLockedOut() {
+  unsigned long now = millis() / 1000;
+  int n = 0;
+  for (int i = 0; i < VERIFY_MAX_FAILURES; i++) {
+    if (verifyFailureSec[i] > 0 && now - verifyFailureSec[i] < VERIFY_LOCKOUT_SEC) n++;
+  }
+  return n >= VERIFY_MAX_FAILURES;
+}
+
+bool verifyUserCodeInWindow(long userCode) {
+  unsigned long nowSec = millis() / 1000;
+  if (userCode == verifyLastAcceptedCode && nowSec - verifyLastAcceptedSec < VERIFY_REPEAT_SEC) return true;
+  if (verifyCodeLockedOut()) return false;
+  long currentStep = (long)timeManager.now().epoch / TOTP_STEP_SEC;   // real UTC, as GetCommandCode
+  for (long step = currentStep - VERIFY_STEPS_BACK; step <= currentStep + VERIFY_STEPS_AHEAD; step++) {
+    if (secretManager.generateCodeAt(step * TOTP_STEP_SEC) == userCode) {
+      verifyLastAcceptedCode = userCode;
+      verifyLastAcceptedSec = nowSec;
+      return true;
+    }
+  }
+  verifyFailureSec[verifyFailurePos] = nowSec > 0 ? nowSec : 1;
+  verifyFailurePos = (verifyFailurePos + 1) % VERIFY_MAX_FAILURES;
+  return false;
+}
 void lowMemoryWatchdogTick() {
   static uint32_t lowSec = 0;
   if (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) >= WEB_MIN_FREE_BLOCK) {
@@ -3748,7 +3791,8 @@ void loop() {
       long userCode = codeInString.toInt();
       // Was hard-wired to true (every code accepted). Annabelle becomes the mother microcontroller
       // (2026-11-18), so this is now the real check, against the real UTC epoch like GetCommandCode.
-      boolean validCode = secretManager.checkCode(userCode, timeManager.now().epoch);
+      // 2026-11-19: any step of the last 15 minutes (verifyUserCodeInWindow), not only the current one
+      boolean validCode = codeInString.length() > 0 && verifyUserCodeInWindow(userCode);
       Serial.println(validCode ? "Ok-Valid Code" : "Failure-Invalid Code");
       Serial.flush();
     } else if (command.startsWith("GetSecret")) {
