@@ -64,7 +64,7 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 //      (Level Setup full / low alarm depth) and 59 (relayStatus - the devices "Relay" badge), before
 //      sentby/routes; latitude/longitude go with 6 decimals (were 2: Pool showed ~1 km off on devices) -
 //      also in the Gloria, Seedling and Pancho serializers.
-const int firmwareVersion = 16;
+const int firmwareVersion = 22;   // = the GitHub release (22: user codes on real UTC, 2026-11-19)
 #define FIRMWARE_BUILD_TIME __DATE__ " " __TIME__
 
 // Display settings for 2.4" SSD1309 — same OLED hardware as Paula
@@ -3429,6 +3429,24 @@ int verifyFailurePos = 0;
 long verifyLastAcceptedCode = -1;
 unsigned long verifyLastAcceptedSec = 0;
 
+// Real UTC from the RTC, which keeps Melbourne local time (2026-11-19, as Cleotilde's rtcUtcEpoch()). Not
+// timeManager.now().epoch: TimeUtils only learns the UTC offset inside epochToNumericTime(), which Annabelle never
+// calls, so that epoch is local time counted as UTC, 11 h ahead in AEDT, and no authenticator app agreed with it.
+time_t rtcUtcEpoch() {
+  RTCInfoRecord r = timeManager.now();
+  setenv("TZ", timezone.c_str(), 1);
+  tzset();
+  struct tm rtc = {};
+  rtc.tm_year = r.year - 1900;
+  rtc.tm_mon = r.month - 1;
+  rtc.tm_mday = r.date;
+  rtc.tm_hour = r.hour;
+  rtc.tm_min = r.minute;
+  rtc.tm_sec = r.second;
+  rtc.tm_isdst = -1;
+  return mktime(&rtc);
+}
+
 bool verifyCodeLockedOut() {
   unsigned long now = millis() / 1000;
   int n = 0;
@@ -3442,7 +3460,7 @@ bool verifyUserCodeInWindow(long userCode) {
   unsigned long nowSec = millis() / 1000;
   if (userCode == verifyLastAcceptedCode && nowSec - verifyLastAcceptedSec < VERIFY_REPEAT_SEC) return true;
   if (verifyCodeLockedOut()) return false;
-  long currentStep = (long)timeManager.now().epoch / TOTP_STEP_SEC;   // real UTC, as GetCommandCode
+  long currentStep = (long)rtcUtcEpoch() / TOTP_STEP_SEC;   // real UTC, as GetCommandCode and the authenticator
   for (long step = currentStep - VERIFY_STEPS_BACK; step <= currentStep + VERIFY_STEPS_AHEAD; step++) {
     if (secretManager.generateCodeAt(step * TOTP_STEP_SEC) == userCode) {
       verifyLastAcceptedCode = userCode;
@@ -3767,7 +3785,9 @@ void loop() {
       // Melbourne local time as UTC (11 h ahead in AEDT) - its codes never matched the user's
       // authenticator. Same time base as VerifyUserCode below. The LoRa codes (generateCodeAt with
       // annabelleTime / senderTime) are left on the local-as-UTC base the field devices use.
-      long code = secretManager.generateCode(timeManager.now().epoch);
+      // 2026-11-19: real UTC (rtcUtcEpoch), so the code is the authenticator app's; generateCodeAt keeps it out of
+      // the old code history
+      long code = secretManager.generateCodeAt((long)rtcUtcEpoch());
       //
       // patch a bug in the totp library
       // if the first digit is a zero, it
