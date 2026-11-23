@@ -66,7 +66,8 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 //      also in the Gloria, Seedling and Pancho serializers.
 // 23 = 2026-11-23: Chinampa system pause - "Clear pause" button on its card (DEVICE_COMMAND_CLEAR_PAUSE over
 //      LoRa, resent until Chinampa reports no pause), and the pause shown inverted on the OLED like the USB
-//      jumper warning (also code 10, sump full). Needs the web page (data/) uploaded too.
+//      jumper warning (also code 10, sump full); "Send test alert" (DEVICE_COMMAND_TEST_ALERT, code 14 for 5 min,
+//      the pump keeps running). Needs the web page (data/) uploaded too.
 const int firmwareVersion = 23;   // = the GitHub release (23: Chinampa Clear pause, 2026-11-23)
 #define FIRMWARE_BUILD_TIME __DATE__ " " __TIME__
 
@@ -1028,8 +1029,9 @@ void fillTelepathonsJson(JsonDocument &json) {
       if (ch && !isnan(ch->v[5])) {
         JsonObject p = r["pause"].to<JsonObject>();
         p["code"] = (int)ch->v[5];
-        if (s.cmdState != DEVICE_COMMAND_STATE_NONE && s.cmdCommand == DEVICE_COMMAND_CLEAR_PAUSE) {
+        if (s.cmdState != DEVICE_COMMAND_STATE_NONE && (s.cmdCommand == DEVICE_COMMAND_CLEAR_PAUSE || s.cmdCommand == DEVICE_COMMAND_TEST_ALERT)) {
           JsonObject c = p["cmd"].to<JsonObject>();
+          c["test"] = s.cmdCommand == DEVICE_COMMAND_TEST_ALERT;
           c["state"] = s.cmdState;
           c["sends"] = s.cmdSends;
           c["ageSec"] = s.cmdAgeSec;
@@ -1049,7 +1051,7 @@ void fillTelepathonsJson(JsonDocument &json) {
     }
     // WiFi (Daffodils): last reported status (0 off, 1 own hotspot, 2 router, 3 router + internet)
     // and the last on/off request from this page - state 1 waiting, 2 done, 3 gave up.
-    if (s.wifiKnown && s.cmdCommand != DEVICE_COMMAND_CLEAR_PAUSE) {
+    if (s.wifiKnown && s.cmdCommand != DEVICE_COMMAND_CLEAR_PAUSE && s.cmdCommand != DEVICE_COMMAND_TEST_ALERT) {
       JsonObject w = r["wifi"].to<JsonObject>();
       w["status"] = s.wifiStatus;
       if (s.cmdState != DEVICE_COMMAND_STATE_NONE) {
@@ -2035,7 +2037,7 @@ void processLora(int packetSize) {
     if (ok) {
       // a "Clear pause" from this page is done once Chinampa reports no pause (DeviceCommandQueue::notePauseState)
       portENTER_CRITICAL(&heardMux);
-      deviceCommandQueue.notePauseState(chinampaData.serialnumberarray, chinampaData.alertcode >= 11 && chinampaData.alertcode <= 13, millis());
+      deviceCommandQueue.notePauseState(chinampaData.serialnumberarray, chinampaData.alertcode, millis());
       portEXIT_CRITICAL(&heardMux);
     }
     if (debug) Serial.print("received chinampaData from ");
@@ -2446,6 +2448,10 @@ void showChinampaPage1() {
   } else if (chinampaData.alertcode == 10) {
     display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
     display.println(" !! SUMP FULL !!     ");
+    display.setTextColor(SSD1306_WHITE);
+  } else if (chinampaData.alertcode == CHINAMPA_ALERT_TEST) {
+    display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
+    display.println(" !! TEST ALERT !!    ");
     display.setTextColor(SSD1306_WHITE);
   } else if (chinampaData.alertstatus) {
     if (chinampaData.alertcode > 0 && chinampaData.alertcode < 10) {
@@ -3112,9 +3118,11 @@ void processWebAction() {
       setWebResult(String("WiFi ") + b + " requested for " + a);
     }
   } else if (action == WEB_DEVICE_PAUSE) {
-    // a = Chinampa's serial as 16 hex digits, b = "clear" (telepathons.js Clear pause button, 2026-11-23)
+    // a = Chinampa's serial as 16 hex digits, b = "clear" or "test" (telepathons.js Clear pause / Send test
+    // alert buttons, 2026-11-23)
     uint8_t serial[8];
-    bool valid = strlen(a) == 16 && strcmp(b, "clear") == 0;
+    bool test = strcmp(b, "test") == 0;
+    bool valid = strlen(a) == 16 && (test || strcmp(b, "clear") == 0);
     for (int i = 0; valid && i < 8; i++) {
       char hex[3] = { a[i * 2], a[i * 2 + 1], 0 };
       char *end;
@@ -3122,12 +3130,12 @@ void processWebAction() {
       valid = *end == 0;
     }
     if (!valid) {
-      setWebResult(String("Not a valid Clear pause request: ") + a + " " + b);
+      setWebResult(String("Not a valid Chinampa request: ") + a + " " + b);
     } else {
       portENTER_CRITICAL(&heardMux);
-      deviceCommandQueue.request(serial, DEVICE_COMMAND_CLEAR_PAUSE, 0, millis());
+      deviceCommandQueue.request(serial, test ? DEVICE_COMMAND_TEST_ALERT : DEVICE_COMMAND_CLEAR_PAUSE, 0, millis());
       portEXIT_CRITICAL(&heardMux);
-      setWebResult(String("Clear pause requested for ") + a);
+      setWebResult(String(test ? "Test alert" : "Clear pause") + " requested for " + a);
     }
   } else if (action == WEB_SET_GPS) {
     double lat = atof(a), lon = atof(b);

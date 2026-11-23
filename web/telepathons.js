@@ -153,29 +153,33 @@ function wifiLine(t) {
 var PAUSE_REASONS = { 11: "fish tank level did not drop with the solenoid open", 12: "drained an over-full fish tank too long",
     13: "fish tank level did not rise with the pump on" };
 function pauseLine(t) {
-    var p = t.pause, c = p.cmd, paused = p.code >= 11 && p.code <= 13;
-    var pending = c && c.state === 1;
-    if (!paused && !c) return "";
+    var p = t.pause, c = p.cmd, paused = p.code >= 11 && p.code <= 13, testing = p.code === 14;
+    var pending = c && c.state === 1, what = c && c.test ? "Test alert" : "Clearing";
     var html = paused ? '<span class="bad">&#9888; System paused (' + p.code + "): " + esc(PAUSE_REASONS[p.code] || "") + " - solenoid and pump off</span>"
+        : testing ? '<span style="color:#ef6c00">&#9888; Test alert on (14) - the pump keeps running, ends by itself after 5 min</span>'
         : '<span style="color:#2e7d32">&#10003; Running</span>';
     if (pending) {
-        html += '<br><span style="color:#ef6c00">Clearing... sent ' + c.sends + (c.sends === 1 ? " time, " : " times, ") + fmtAgo(c.ageSec) + "</span>";
+        html += '<br><span style="color:#ef6c00">' + what + "... sent " + c.sends + (c.sends === 1 ? " time, " : " times, ") + fmtAgo(c.ageSec) + "</span>";
     } else if (c && c.state === 2) {
-        html += '<br><span style="color:#555">Pause cleared from this page ' + fmtAgo(c.ageSec) + "</span>";
+        html += '<br><span style="color:#555">' + (c.test ? "Test alert asked" : "Pause cleared") + " from this page " + fmtAgo(c.ageSec) + "</span>";
     } else if (c && c.state === 3) {
-        html += '<br><span class="bad">Clearing gave up after ' + CMD_TIMEOUT_MIN + " min - Chinampa not heard</span>";
+        html += '<br><span class="bad">' + what + " gave up after " + CMD_TIMEOUT_MIN + " min - Chinampa not heard</span>";
     }
-    var btn = !paused ? "" : pending ? '<button class="btn btn-outline-secondary btn-sm" disabled>Waiting...</button>'
-        : '<button class="btn btn-danger btn-sm" data-pause="clear" data-serial="' + esc(t.serial) + '">Clear pause</button>';
+    var btn = pending ? '<button class="btn btn-outline-secondary btn-sm" disabled>Waiting...</button>'
+        : paused ? '<button class="btn btn-danger btn-sm" data-pause="clear" data-serial="' + esc(t.serial) + '">Clear pause</button>'
+        : testing ? ""
+        : '<button class="btn btn-outline-secondary btn-sm" data-pause="test" data-serial="' + esc(t.serial) + '">Send test alert</button>';
     return '<div class="d-flex justify-content-between align-items-center" style="font-size:13px;margin:2px 0 4px 0;gap:8px"><div>'
         + html + "</div>" + btn + "</div>";
 }
 
 function sendPause(btn) {
-    if (!confirm("Restart the pump and solenoid on Chinampa? Check the fish tank sensor, solenoid and pump first.")) return;
+    var test = btn.getAttribute("data-pause") === "test";
+    if (!confirm(test ? "Ask Chinampa for a test alert? It shows on this page and the phones for 5 minutes; the pump keeps running."
+        : "Restart the pump and solenoid on Chinampa? Check the fish tank sensor, solenoid and pump first.")) return;
     btn.disabled = true;
     fetch("/AnnabelleServlet", { method: "POST", body: new URLSearchParams({
-        formName: "DevicePause", serial: btn.getAttribute("data-serial"), state: "clear" }) })
+        formName: "DevicePause", serial: btn.getAttribute("data-serial"), state: test ? "test" : "clear" }) })
         .then(function (r) { return r.text(); })
         .then(function (t) {
             if (t !== "Queued") alert(t);
