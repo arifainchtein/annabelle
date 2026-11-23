@@ -147,6 +147,43 @@ function wifiLine(t) {
         + html + "</div>" + btn + "</div>";
 }
 
+// Chinampa system pause (2026-11-23, "pause" in fillTelepathonsJson): codes 11-13 mean the solenoid and pump
+// are off until cleared. "Clear pause" is sent over LoRa (DEVICE_COMMAND_CLEAR_PAUSE) and resent until
+// Chinampa's records show no pause - the same as typing ClearPause at its serial port.
+var PAUSE_REASONS = { 11: "fish tank level did not drop with the solenoid open", 12: "drained an over-full fish tank too long",
+    13: "fish tank level did not rise with the pump on" };
+function pauseLine(t) {
+    var p = t.pause, c = p.cmd, paused = p.code >= 11 && p.code <= 13;
+    var pending = c && c.state === 1;
+    if (!paused && !c) return "";
+    var html = paused ? '<span class="bad">&#9888; System paused (' + p.code + "): " + esc(PAUSE_REASONS[p.code] || "") + " - solenoid and pump off</span>"
+        : '<span style="color:#2e7d32">&#10003; Running</span>';
+    if (pending) {
+        html += '<br><span style="color:#ef6c00">Clearing... sent ' + c.sends + (c.sends === 1 ? " time, " : " times, ") + fmtAgo(c.ageSec) + "</span>";
+    } else if (c && c.state === 2) {
+        html += '<br><span style="color:#555">Pause cleared from this page ' + fmtAgo(c.ageSec) + "</span>";
+    } else if (c && c.state === 3) {
+        html += '<br><span class="bad">Clearing gave up after ' + CMD_TIMEOUT_MIN + " min - Chinampa not heard</span>";
+    }
+    var btn = !paused ? "" : pending ? '<button class="btn btn-outline-secondary btn-sm" disabled>Waiting...</button>'
+        : '<button class="btn btn-danger btn-sm" data-pause="clear" data-serial="' + esc(t.serial) + '">Clear pause</button>';
+    return '<div class="d-flex justify-content-between align-items-center" style="font-size:13px;margin:2px 0 4px 0;gap:8px"><div>'
+        + html + "</div>" + btn + "</div>";
+}
+
+function sendPause(btn) {
+    if (!confirm("Restart the pump and solenoid on Chinampa? Check the fish tank sensor, solenoid and pump first.")) return;
+    btn.disabled = true;
+    fetch("/AnnabelleServlet", { method: "POST", body: new URLSearchParams({
+        formName: "DevicePause", serial: btn.getAttribute("data-serial"), state: "clear" }) })
+        .then(function (r) { return r.text(); })
+        .then(function (t) {
+            if (t !== "Queued") alert(t);
+            setTimeout(poll, 1500);
+        })
+        .catch(function () { btn.disabled = false; alert("Cannot reach Annabelle"); });
+}
+
 function sendWifi(btn) {
     btn.disabled = true;
     fetch("/AnnabelleServlet", { method: "POST", body: new URLSearchParams({
@@ -245,6 +282,7 @@ function cardBody(t, card, nowSec, isFront) {
     if (tab === "r") {
         if (t.sync && isFront) body += syncLine(t.sync);
         if (t.wifi && isFront) body += wifiLine(t);
+        if (t.pause && isFront) body += pauseLine(t);
         body += row("Signal", card.rssi + " dBm, SNR " + Number(card.snr).toFixed(1));
         var rx = hasSentBy(card) ? card : (isFront && t.data && hasSentBy(t.data) ? t.data : null);
         if (rx) body += row("Received", rx.via ? '<span class="tp-via">via ' + esc(rx.via) + "</span>" : "direct from the device");
@@ -618,6 +656,8 @@ document.addEventListener("click", function (e) {
     }
     var wb = e.target.closest("[data-wifi]");
     if (wb) sendWifi(wb);
+    var pb = e.target.closest("[data-pause]");
+    if (pb) sendPause(pb);
 });
 
 // Swipe left for older, right for newer.
