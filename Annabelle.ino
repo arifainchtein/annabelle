@@ -9,6 +9,7 @@
 #include <ErrorDefinitions.h>
 #include <GloriaTankFlowPumpData.h>
 #include <LangleyData.h>
+#include "SensorSampleStore.h"  // GloriaData + SensorSampleRecord (2026-11-26)
 #include <ChinampaData.h>
 #include <CommaRecord.h>
 #include <DigitalStablesData.h>
@@ -164,6 +165,11 @@ bool seedlingMonitoringDataNewData = false;
 bool chinampaDataNewData = false;
 bool commaDataNewData = false;
 bool langleyDataNewData = false;
+// Gloria (GloriaData) and the soil / rain samples any device sends (SensorSampleRecord) - SensorSampleStore.h
+GloriaData gloriaData;
+SensorSampleRecord sensorSample;
+SensorSampleStore sensorSampleStore;
+GloriaDataQueue gloriaDataQueue;
 
 OneWire oneWire(27);
 DallasTemperature tempSensor(&oneWire);
@@ -216,7 +222,8 @@ constexpr size_t loraPacketSizes[] = {
   sizeof(SeedlingMonitorData), sizeof(CommaRecord), sizeof(VitalSignsRecord), sizeof(WeatherForecastUpdate),
   sizeof(GraveyardShiftUpdate), sizeof(RequestCommand), sizeof(DeviceIdentityRecord),
   sizeof(VitalSignsRecordV2), sizeof(VitalSignsRecordV3), sizeof(PowerProfileRecord), sizeof(DeviceCommandRecord),
-  sizeof(LinkAckRecord), sizeof(WeatherForecast8Update), sizeof(LinkHealthRecord)
+  sizeof(LinkAckRecord), sizeof(WeatherForecast8Update), sizeof(LinkHealthRecord),
+  sizeof(GloriaData), sizeof(SensorSampleRecord)
 };
 static_assert(LoRaPacketSizeCheck::allDistinct(loraPacketSizes, sizeof(loraPacketSizes) / sizeof(loraPacketSizes[0]), 0, 1),
               "two LoRa packet structs have the same size - receivers dispatch on size, so they would be confused");
@@ -610,7 +617,7 @@ static void noteCard(const char *rawName, size_t nameLen, const uint8_t *serial,
   if (kind && (!e->kind[0] || type != CARD_VITAL)) strncpy(e->kind, kind, sizeof(e->kind) - 1);
   e->lastEpoch = card.epoch;
   e->rssi = rssi;
-  if (ok && type >= CARD_DAFFODIL && type <= CARD_SEEDLING) e->dataHeard++;  // link health: delivery ratio
+  if (ok && ((type >= CARD_DAFFODIL && type <= CARD_SEEDLING) || type == CARD_GLORIA_PUMP)) e->dataHeard++;  // link health: delivery ratio
   e->snr = snr;
   if (ok) {
     if (e->okCount++ == 0) e->histLen = e->histHead = 0;  // just became real: drop the junk cards
@@ -704,6 +711,30 @@ void noteGloriaPacket(const GloriaTankFlowPumpData &d, bool ok) {
   float v[] = { d.solarvoltage, d.capacitorvoltage, d.totalMilliLitres, d.totalMilliLitres2, (float)d.temperature, clockOffset(d.secondsTime) };
   static_assert(sizeof(v) / sizeof(v[0]) <= CARD_VALUES, "more values than a HeardCard holds");
   noteCard(d.devicename, sizeof(d.devicename), d.serialnumberarray, "Gloria", CARD_GLORIA, ok, (int)d.rssi, d.snr, v, 6);
+}
+
+// Gloria solar pump controller (GloriaData, 2026-11-26) - CARD_GLORIA_PUMP, telepathons.js type 11
+void noteGloriaDataPacket(const GloriaData &d, bool ok) {
+  float v[] = { d.batteryVoltage, d.batteryCurrentMa, d.solarVoltage, d.solarCurrentMa,
+                (float)(d.pumpOn | (d.autoMode << 1) | (d.pumpFault << 2) | (d.emergencyOpen << 3)),
+                d.flowRateLpm, d.flowTotalLitres, clockOffset(d.secondsTime), d.sleepTime };
+  static_assert(sizeof(v) / sizeof(v[0]) <= CARD_VALUES, "more values than a HeardCard holds");
+  nextCardVia = viaFromSentBy(d.sentbyarray);
+  noteCard(d.devicename, sizeof(d.devicename), d.serialnumberarray, "Gloria", CARD_GLORIA_PUMP, ok, (int)d.rssi, d.snr, v, 9);
+  if (ok) noteSyncAndWifi(d.devicename, sizeof(d.devicename), d.serialnumberarray, (int)d.opMode, v[7], (uint8_t)d.wifiStatus);
+}
+
+// A soil / rain sample (SensorSampleRecord) - CARD_SAMPLE, type 12: the first 8 values, then the driver,
+// role and kind packed into v[8] (driver index * 100 + role * 10 + kind; driver index 99 = not known here).
+// The full sample, with its position, is in sensorSampleStore (/SensorSamples) and goes to the Pi.
+void noteSamplePacket(const SensorSampleRecord &r, bool ok) {
+  float v[CARD_VALUES];
+  for (int i = 0; i < SENSOR_SAMPLE_VALUES; i++) v[i] = i < r.valueCount ? r.values[i] : NAN;
+  const ModbusSensorDriver *drv = sampleDriver(r);
+  int di = drv ? (int)(drv - MODBUS_SENSOR_DRIVERS) : 99;
+  v[8] = di * 100 + (r.role % 10) * 10 + (r.kind % 10);
+  nextCardVia = viaFromSentBy(r.sentbyarray);
+  noteCard(r.devicename, sizeof(r.devicename), r.serialnumberarray, nullptr, CARD_SAMPLE, ok, (int)r.rssi, r.snr, v, 9);
 }
 
 void noteSeedlingPacket(const SeedlingMonitorData &d, bool ok) {
@@ -843,17 +874,20 @@ static HeardCard historyCopy[HEARD_HISTORY];
 static HeardCard latestData, latestVital, latestLink;
 static int8_t latestFunction;
 static float latestSensors[DAFFODIL_SENSORS];
+static HeardCard latestSample;  // newest soil / rain sample card (CARD_SAMPLE) of the row
+static bool hasSample = false;
 static void copyLatestCards(int row, uint16_t gen, bool &hasData, bool &hasVital, bool &hasLink) {
-  hasData = hasVital = hasLink = false;
+  hasData = hasVital = hasLink = hasSample = false;
   latestFunction = 0;
   portENTER_CRITICAL(&heardMux);
   const HeardEntry &e = heard[row];
   if (e.gen == gen) {
     latestFunction = e.function;
     memcpy(latestSensors, e.sensors, sizeof(latestSensors));
-    for (int i = 0; i < e.histLen && !(hasData && hasVital && hasLink); i++) {
+    for (int i = 0; i < e.histLen && !(hasData && hasVital && hasLink && hasSample); i++) {
       const HeardCard &c = e.history[(e.histHead + HEARD_HISTORY - 1 - i) % HEARD_HISTORY];
-      if (!hasData && c.type >= CARD_DAFFODIL && c.type <= CARD_SEEDLING) { latestData = c; hasData = true; }
+      if (!hasData && ((c.type >= CARD_DAFFODIL && c.type <= CARD_SEEDLING) || c.type == CARD_GLORIA_PUMP)) { latestData = c; hasData = true; }
+      if (!hasSample && c.type == CARD_SAMPLE) { latestSample = c; hasSample = true; }
       if (!hasVital && c.type == CARD_VITAL) { latestVital = c; hasVital = true; }
       if (!hasLink && c.type == CARD_LINK) { latestLink = c; hasLink = true; }
     }
@@ -1015,6 +1049,7 @@ void fillTelepathonsJson(JsonDocument &json) {
       if (hasData && latestData.type != s.front.type) cardJson(r["data"].to<JsonObject>(), latestData);
       if (hasVital && s.front.type != CARD_VITAL) cardJson(r["vital"].to<JsonObject>(), latestVital);
       if (hasLink && s.front.type != CARD_LINK) cardJson(r["link"].to<JsonObject>(), latestLink);
+      if (hasSample && s.front.type != CARD_SAMPLE) cardJson(r["sample"].to<JsonObject>(), latestSample);
       // Daffodil function and its sensor readings (daffodilSensors), NAN -> null
       if (latestFunction) {
         r["fn"] = latestFunction;
@@ -1450,6 +1485,10 @@ uint8_t calculateChecksum(const T& data) {
     checksumOffset = offsetof(VitalSignsRecordV3, checksum);
   } else if constexpr (std::is_same<T, PowerProfileRecord>::value) {
     checksumOffset = offsetof(PowerProfileRecord, checksum);
+  } else if constexpr (std::is_same<T, GloriaData>::value) {
+    checksumOffset = offsetof(GloriaData, checksum);
+  } else if constexpr (std::is_same<T, SensorSampleRecord>::value) {
+    checksumOffset = offsetof(SensorSampleRecord, checksum);
   }
 
   for (size_t i = 0; i < checksumOffset; i++) {
@@ -1488,6 +1527,9 @@ bool validateChecksum(const T& receivedData) {
     receivedChecksum = tempData.checksum;
     tempData.checksum = 0;
   } else if constexpr (std::is_same<T, PowerProfileRecord>::value) {
+    receivedChecksum = tempData.checksum;
+    tempData.checksum = 0;
+  } else if constexpr (std::is_same<T, GloriaData>::value || std::is_same<T, SensorSampleRecord>::value) {
     receivedChecksum = tempData.checksum;
     tempData.checksum = 0;
   }
@@ -1968,6 +2010,37 @@ void processLora(int packetSize) {
       portEXIT_CRITICAL(&heardMux);
     }
     noteLangleyPacket(langleyData, checksumOk);
+
+  } else if (packetSize == sizeof(GloriaData)) {
+    // Gloria solar pump controller (2026-11-26; it sent LangleyData before, and showed as a Langley)
+    memset(&gloriaData, 0, sizeof(GloriaData));
+    rxPacketRead((uint8_t*)&gloriaData, sizeof(GloriaData));
+    bool checksumOk = validateChecksum(gloriaData);  // on the bytes as received, as for Langley
+    gloriaData.rssi = rxPacketRssi();
+    gloriaData.snr = rxPacketSnr();
+    if (debug) Serial.printf("received GloriaData from %.16s cksum=%s\n", gloriaData.devicename, checksumOk ? "ok" : "BAD");
+    if (checksumOk) {
+      gloriaDataQueue.add(gloriaData);
+      // Weather reply (Gloria sets its clock from it) and WiFi commands, as for a Langley
+      queueWeatherReply(gloriaData.serialnumberarray, gloriaData.devicename, (long)gloriaData.sleepTime, (int)gloriaData.opMode);
+      portENTER_CRITICAL(&heardMux);
+      deviceCommandQueue.noteDataPacket(gloriaData.serialnumberarray, (int)gloriaData.wifiStatus != 0,
+                                        gloriaData.sleepTime > 0, millis());
+      portEXIT_CRITICAL(&heardMux);
+    }
+    noteGloriaDataPacket(gloriaData, checksumOk);
+
+  } else if (packetSize == sizeof(SensorSampleRecord)) {
+    // A soil / rain sample from any device: Gloria's fixed probes, Paula2 around the farm, a bench test
+    memset(&sensorSample, 0, sizeof(SensorSampleRecord));
+    rxPacketRead((uint8_t*)&sensorSample, sizeof(SensorSampleRecord));
+    bool ok = sensorSample.recordType == SENSOR_SAMPLE_TYPE && validateChecksum(sensorSample);
+    sensorSample.rssi = rxPacketRssi();
+    sensorSample.snr = rxPacketSnr();
+    bool isNew = ok && sensorSampleStore.add(sensorSample, heardNow());
+    if (debug) Serial.printf("received SensorSample #%u %.8s from %.16s %s\n", sensorSample.sampleId, sensorSample.driver,
+                             sensorSample.devicename, !ok ? "BAD" : isNew ? "ok" : "ok (copy)");
+    if (!ok || isNew) noteSamplePacket(sensorSample, ok);
 
   } else if (packetSize == sizeof(GloriaTankFlowPumpData)) {
     memset(&gloriaTankFlowPumpData, 0, sizeof(GloriaTankFlowPumpData));
@@ -2712,6 +2785,10 @@ void showLastReceivedData() {
     showGenericReceivedData("Seedling", seedlingMonitorData.devicename, seedlingMonitorData.rssi, seedlingMonitorData.snr);
   } else if (lastReceivedPacketSize == sizeof(LangleyData)) {
     showLangleyPage();
+  } else if (lastReceivedPacketSize == sizeof(GloriaData)) {
+    showGenericReceivedData("Gloria", gloriaData.devicename, gloriaData.rssi, gloriaData.snr);
+  } else if (lastReceivedPacketSize == sizeof(SensorSampleRecord)) {
+    showGenericReceivedData("Sample", sensorSample.devicename, sensorSample.rssi, sensorSample.snr);
   } else if (lastReceivedPacketSize == sizeof(WeatherForecastUpdate)) {
     showWeatherForecast();
   } else if (lastReceivedPacketSize > 0) {
@@ -3363,6 +3440,7 @@ void setup() {
   wifiManager.setTelepathonsProvider(fillTelepathonsJson);
   wifiManager.setHistoryProvider(fillTelepathonHistoryJson);
   wifiManager.setRadioHistoryProvider(fillRadioHistoryJson);
+  wifiManager.setSensorSamplesProvider([](JsonDocument &json) { sensorSampleStore.toJson(json); });
   wifiManager.setWebDataExtras(addWebDataExtras);
   wifiManager.setSettingsAction(queueWebAction);
   wifiManager.pingVerbose = debug;  // its ping lines went to the Pi's serial line
@@ -3375,6 +3453,8 @@ void setup() {
   }
   routeBegin();
   routesLookupHook() = routesLookup;  // the serializers' "routes:" token (SentBy.h)
+  sensorSampleStore.begin();
+  gloriaDataQueue.begin();
   wifiManager.start();
   bool stationmode = wifiManager.getStationMode();
   wifiStationWanted = stationmode && wifiManager.getSSID() != "";
@@ -3935,6 +4015,7 @@ void loop() {
       // + 1 when Annabelle's own status line will go too (pushAnnabelleStatusToSerial, 2026-11-01)
       // + 1 when the 5-day forecast line will go too (pushForecastToSerial, firmware 14)
       Serial.println(dataManager.getPendingQueueItemCount() + vitalSignsStore.pendingCount() + deviceIdentityStore.pendingCount() + powerProfileStore.pendingCount()
+                     + gloriaDataQueue.pendingCount() + sensorSampleStore.pendingCount()
                      + (annabelleStatusDue() ? 1 : 0) + (forecastToPiDue() ? 1 : 0));
       //
       // Per-type available/dropped/flash-health breakdown, added 2026-08-04
@@ -4055,6 +4136,8 @@ void loop() {
       int vitalDownloaded = vitalSignsStore.pushPendingToSerial(Serial);
       int identityDownloaded = deviceIdentityStore.pushPendingToSerial(Serial);
       int powerDownloaded = powerProfileStore.pushPendingToSerial(Serial);
+      int gloriaPumpDownloaded = gloriaDataQueue.pushPendingToSerial(Serial);
+      int samplesDownloaded = sensorSampleStore.pushPendingToSerial(Serial);
       int statusDownloaded = pushAnnabelleStatusToSerial(Serial);
       // after the status line, so the Pi already has the telepathon "Annabelle" to put it in
       int forecastDownloaded = pushForecastToSerial(Serial);
@@ -4071,6 +4154,8 @@ void loop() {
       Serial.print("|Power="); Serial.print(powerDownloaded);
       Serial.print("|Annabelle="); Serial.print(statusDownloaded);
       Serial.print("|Forecast="); Serial.print(forecastDownloaded);
+      Serial.print("|GloriaPump="); Serial.print(gloriaPumpDownloaded);
+      Serial.print("|Samples="); Serial.print(samplesDownloaded);
       //
       // Reset diagnostics ride on the AsyncData terminator so the Hypothalamus
       // records them every Async Cycle (generic to any microcontroller):

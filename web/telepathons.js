@@ -25,8 +25,40 @@ var CARD_TYPES = {
     9: { name: "Power profile", checksum: true, f: [["Capacity", "mAh", 0]], tabs: "p" },
     10: { name: "Link health", checksum: true, f: [["Delivered here", "%", 0], ["Data sent", "", 0], ["Data scheduled", "", 0],
         ["Busy on every check", "", 0], ["Missed send slots", "", 0], ["Noise floor", "dBm", 0], ["Hears Annabelle at", "dBm", 0],
-        ["Annabelle SNR", "dB", 1], ["CRC errors", "", 0]], tabs: "rrrrrrrrr" }
+        ["Annabelle SNR", "dB", 1], ["CRC errors", "", 0]], tabs: "rrrrrrrrr" },
+    // Gloria solar pump controller (GloriaData, 2026-11-26) - noteGloriaDataPacket()
+    11: { name: "Data", checksum: true, f: [["Battery", "V", 2], ["Battery current", "mA", 1], ["Solar", "V", 2], ["Solar current", "mA", 1],
+        ["Pump", pumpText], ["Flow", "L/min", 1], ["Flow total", "L", 0], ["Clock", clockText], ["Sleep", "s", 0]], tabs: "ppppsssss" },
+    // A soil / rain sample (SensorSampleRecord) from any device - noteSamplePacket(); labels from SAMPLE_DRIVERS
+    12: { name: "Sample", checksum: true, sample: true }
 };
+
+// Gloria's pump bits (noteGloriaDataPacket): 1 on, 2 AUTO, 4 dry-run fault, 8 emergency switch open
+function pumpText(v) {
+    var t = (v & 1 ? "ON" : "off") + ", " + (v & 2 ? "AUTO" : "MANUAL");
+    if (v & 4) t += ', <span class="bad">stopped: no flow</span>';
+    if (v & 8) t += ', <span class="bad">emergency switch open</span>';
+    return t;
+}
+
+// The RS485 sensor drivers, in MODBUS_SENSOR_DRIVERS order (ModbusSensorDrivers.cpp in DigitalStablesEsp32Lib):
+// a sample card's v[8] = driver index * 100 + role * 10 + kind. Keep in step with the library. The full
+// samples, with positions, are at /SensorSamples.
+var SAMPLE_DRIVERS = [
+    { name: "Soil 7-in-1 probe", f: [["Moisture", "%", 1], ["Soil temperature", "°C", 1], ["pH", "", 1], ["EC", "uS/cm", 0],
+        ["Nitrogen", "mg/kg", 0], ["Phosphorus", "mg/kg", 0], ["Potassium", "mg/kg", 0], ["Salt", "", 0]] },
+    { name: "Renke DO probe", f: [["DO saturation", "%", 1], ["Dissolved oxygen", "mg/L", 2], ["Water temperature", "°C", 1]] }
+];
+var SAMPLE_ROLES = ["", "Rain", "Soil reference", "Soil test"];
+var SAMPLE_KINDS = ["monitor", "spot sample", "bench test"];
+function sampleFields(card) {
+    var meta = card.v && card.v[8] !== null && card.v[8] !== undefined ? Math.round(card.v[8]) : 9900;
+    var drv = SAMPLE_DRIVERS[Math.floor(meta / 100)];
+    var role = SAMPLE_ROLES[Math.floor(meta / 10) % 10] || "", kind = SAMPLE_KINDS[meta % 10] || "";
+    var title = (drv ? drv.name : "Unknown sensor") + (role ? " · " + role : "") + (kind && kind !== "monitor" ? " · " + kind : "");
+    var f = drv ? drv.f : [1, 2, 3, 4, 5, 6, 7, 8].map(function (n) { return ["Value " + n, "", 2]; });
+    return { title: title, f: f };
+}
 
 // Daffodil functions (config switch, DigitalStablesData.h FUN_*/DAFFODIL_*): the name and the labels of
 // the readings Annabelle.ino daffodilSensors() sends for it in "sens", after the board temperature and the
@@ -217,7 +249,7 @@ function valueText(field, v) {
 
 // Green while a device is reporting normally, amber when it has missed a while, red when silent.
 // Sleeping Daffodils and Langleys report every sleep-time seconds, so they get more slack.
-var SLEEP_VALUE = { 1: 6, 3: 8 };  // card type -> index of its sleep time
+var SLEEP_VALUE = { 1: 6, 3: 8, 11: 8 };  // card type -> index of its sleep time
 function ageColor(sec, card) {
     var i = card ? SLEEP_VALUE[card.ty] : undefined;
     var sleep = (i !== undefined && card.v && card.v[i] > 0) ? card.v[i] : 0;
@@ -230,7 +262,7 @@ function ageColor(sec, card) {
 // How a packet arrived (2026-11-11) - card.via is the name in its sentbyarray ("Chinamp", "Paula"...);
 // absent = sentbyarray was empty, the device sent it itself. Only data packets (Daffodil, Chinampa,
 // Langley) carry a sentby, so only they say "direct".
-function hasSentBy(card) { return card && (card.ty === 1 || card.ty === 2 || card.ty === 3); }  // Langley too since 2026-11-11
+function hasSentBy(card) { return card && (card.ty === 1 || card.ty === 2 || card.ty === 3 || card.ty === 11 || card.ty === 12); }  // Langley too since 2026-11-11
 function viaText(card) {
     if (!hasSentBy(card)) return "";
     return card.via ? ' · <span class="tp-via">via ' + esc(card.via) + "</span>" : ' · <span class="tp-direct">direct</span>';
@@ -246,6 +278,10 @@ function navKey(t) { return t.row + ":" + t.gen; }
 function tabSection(card, tab, nowSec) {
     var type = CARD_TYPES[card.ty] || { name: "Type " + card.ty, f: [], tabs: "" };
     var v = card.v || [], html = "";
+    if (type.sample) {  // soil / rain sample: every value on the Sensors tab, labelled by its driver
+        var sf = sampleFields(card);
+        type = { name: sf.title, checksum: true, f: sf.f, tabs: "ssssssss" };
+    }
     type.f.forEach(function (field, i) {
         if ((type.tabs || "").charAt(i) !== tab) return;
         var text = valueText(field, v[i]);
@@ -263,14 +299,16 @@ var TAB_NAMES = { s: "Sensors", p: "Power", r: "Radio" };
 var cardTab = {};   // device name -> s/p/r, remembered on this phone
 try { cardTab = JSON.parse(localStorage.getItem("annabelleCardTabs")) || {}; } catch (e) { }
 
-function isData(c) { return c && c.ty >= 1 && c.ty <= 5; }
+function isData(c) { return c && ((c.ty >= 1 && c.ty <= 5) || c.ty === 11); }
 
 function cardBody(t, card, nowSec, isFront) {
     var cards = [card];
     if (isFront) {
         var data = isData(card) ? card : t.data, vital = card.ty === 6 ? card : t.vital, link = card.ty === 10 ? card : t.link;
+        var sample = card.ty === 12 ? card : t.sample;
         cards = [data, vital, link];
-        if (card !== data && card !== vital && card !== link) cards.push(card);  // comma record, power profile, identity
+        if (sample) cards.push(sample);  // the newest soil / rain sample (Sensors tab)
+        if (card !== data && card !== vital && card !== link && card !== sample) cards.push(card);  // comma record, power profile, identity
     }
     var dataCard = cards[0] && isData(cards[0]) ? cards[0] : null;
     var tab = cardTab[t.name] || "s";

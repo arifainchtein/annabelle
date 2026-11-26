@@ -19,7 +19,9 @@
 // Packet types on a card - telepathons.js has the matching labels (CARD_TYPES).
 enum HeardCardType : uint8_t {
   CARD_DAFFODIL = 1, CARD_CHINAMPA, CARD_LANGLEY, CARD_GLORIA, CARD_SEEDLING,
-  CARD_VITAL, CARD_IDENTITY, CARD_COMMA, CARD_POWER, CARD_LINK  // CARD_LINK: LinkHealthRecord (2026-11-10)
+  CARD_VITAL, CARD_IDENTITY, CARD_COMMA, CARD_POWER, CARD_LINK,  // CARD_LINK: LinkHealthRecord (2026-11-10)
+  CARD_GLORIA_PUMP,  // 11: GloriaData, the Gloria solar pump controller (2026-11-26; CARD_GLORIA is the old tank/flow Gloria)
+  CARD_SAMPLE        // 12: SensorSampleRecord, a soil / rain sample from any device
 };
 
 // One received packet: when, how it was heard, whether it checked out, and up to CARD_VALUES
